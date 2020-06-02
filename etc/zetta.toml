@@ -1,0 +1,19 @@
+[logging]
+log-level = "debug"
+log-file = "log/zetta.log"
+slow-query-file = "log/slowquery.log"
+maxsize = 500 #MB
+maxroll = 1
+
+[zetta.server]
+port = 4000
+
+[zetta.store.mocktikv]
+name = "mocktikv"
+store-path = "/tmp/tidb"
+
+[zetta.store.tikv]
+name = "tikv"
+store-path = "/tmp/tikv"
+
+
