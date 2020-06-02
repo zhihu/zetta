@@ -1,5 +1,4 @@
 # Zetta - TableStore On Tikv
-=============================
 
 ## Introduction
 
