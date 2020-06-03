@@ -2,7 +2,7 @@
 
 ## Introduction
 
-Zetta is an open-source NewSQL database that supports Hybrid Transactional and Cloud Spanner like API 
+Zetta is an open-source NoSQL database that supports Transaction and Cloud Spanner like API 
 
 
 ## Quick start
