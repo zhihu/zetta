@@ -49,7 +49,6 @@ func (t *tableCommon) searchIndex(index string) *model.IndexMeta {
 }
 
 func (t *tableCommon) ReadStore(ctx context.Context, rr *tspb.ReadRequest) (*resultIter, error) {
-
 	cols, cfColMap, _, err := t.prepareFields(ctx, rr.Columns)
 	if err != nil {
 		return nil, err
@@ -70,6 +69,7 @@ func (t *tableCommon) ReadStore(ctx context.Context, rr *tspb.ReadRequest) (*res
 			ri.Close()
 		}()
 		keySet := rr.KeySet
+
 		if keySet.GetAll() {
 			if err := t.allRecord(ctx, cols, cfColMap, ri); err != nil {
 				ri.lastErr = err
@@ -80,6 +80,7 @@ func (t *tableCommon) ReadStore(ctx context.Context, rr *tspb.ReadRequest) (*res
 		}
 		if len(keySet.GetKeys()) > 0 {
 			startTS := time.Now()
+
 			err := t.fetchRows(ctx, keySet.Keys, cols, cfColMap, ri)
 			durFetchRows := time.Since(startTS)
 			if err != nil {

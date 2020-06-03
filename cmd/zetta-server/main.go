@@ -60,7 +60,7 @@ const (
 var (
 	version = flagBoolean(nmVersion, false, "print version information and exit")
 	// Base
-	storePath = flag.String(nmStorePath, "/tmp/tidb", "tidb storage path")
+	storePath = flag.String(nmStorePath, "/tmp/zetta", "tidb storage path")
 	store     = flag.String(nmStore, "mocktikv", "registered store name, [tikv, mocktikv]")
 	port      = flag.Uint(nmListenPort, 4000, "rpc server listening port")
 	// Log

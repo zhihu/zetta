@@ -37,6 +37,8 @@ import (
 	tspb "github.com/zhihu/zetta-proto/pkg/tablestore"
 	"github.com/zhihu/zetta/pkg/model"
 	"github.com/zhihu/zetta/tablestore/infoschema"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func (d *ddl) CreateSchema(ctx sessionctx.Context, dbMeta *model.DatabaseMeta) (err error) {
@@ -107,6 +109,9 @@ func (d *ddl) AddColumn(ctx sessionctx.Context, req *tspb.AddColumnRequest) (err
 
 func (d *ddl) CreateTable(ctx sessionctx.Context, tbMeta *model.TableMeta) (err error) {
 	is := d.GetInfoSchemaWithInterceptor(ctx)
+	if tbMeta.Database == "" {
+		return status.Errorf(codes.FailedPrecondition, "database should be specific")
+	}
 	db, ok := is.GetDatabaseMetaByName(tbMeta.Database)
 	if !ok {
 		return infoschema.ErrDatabaseNotExists.GenWithStackByArgs(db.Database)

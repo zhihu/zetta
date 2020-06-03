@@ -346,6 +346,9 @@ func (rs *RPCServer) Mutate(ctx context.Context, req *tspb.MutationRequest) (*ts
 	}
 	sess := queryCtx.GetSession()
 	sess.SetLastActive(time.Now())
+	if req.GetTransaction() == nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "transaction selector should be specific")
+	}
 	txn, err := sess.RetrieveTxn(ctx, req.GetTransaction(), false)
 	if err != nil {
 		mutateCounterGerneralErr.Inc()
@@ -563,6 +566,7 @@ func (rs *RPCServer) ListDatabase(ctx context.Context, req *tspb.ListDatabaseReq
 func (rs *RPCServer) CreateTable(ctx context.Context, req *tspb.CreateTableRequest) (*tspb.CreateTableResponse, error) {
 	do := domain.GetOnlyDomain()
 	tbMeta := model.NewTableMetaFromPbReq(req)
+	fmt.Println(tbMeta)
 	sctx := mock.NewContext() // Use mock to provide a default session context.
 	err := do.DDL().CreateTable(sctx, tbMeta)
 	if err != nil {
