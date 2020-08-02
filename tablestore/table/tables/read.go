@@ -49,11 +49,11 @@ func (t *tableCommon) searchIndex(index string) *model.IndexMeta {
 }
 
 func (t *tableCommon) ReadStore(ctx context.Context, rr *tspb.ReadRequest) (*resultIter, error) {
+
 	cols, cfColMap, _, err := t.prepareFields(ctx, rr.Columns)
 	if err != nil {
 		return nil, err
 	}
-
 	ri := &resultIter{
 		rowChan: make(chan *tspb.SliceCell, 32),
 		limit:   rr.Limit,
@@ -69,7 +69,6 @@ func (t *tableCommon) ReadStore(ctx context.Context, rr *tspb.ReadRequest) (*res
 			ri.Close()
 		}()
 		keySet := rr.KeySet
-
 		if keySet.GetAll() {
 			if err := t.allRecord(ctx, cols, cfColMap, ri); err != nil {
 				ri.lastErr = err
@@ -80,7 +79,6 @@ func (t *tableCommon) ReadStore(ctx context.Context, rr *tspb.ReadRequest) (*res
 		}
 		if len(keySet.GetKeys()) > 0 {
 			startTS := time.Now()
-
 			err := t.fetchRows(ctx, keySet.Keys, cols, cfColMap, ri)
 			durFetchRows := time.Since(startTS)
 			if err != nil {
@@ -469,7 +467,7 @@ func (t *tableCommon) fetchRows(ctx context.Context, lvs []*tspb.ListValue, cols
 			Cells:       []*tspb.Cell{},
 		}
 
-		if len(cols) == 0 {
+		if len(cols) == 0 { // the entire row
 			for _, cf := range t.CFs {
 				rkeyMap := cfFields[cf.Name]
 				cellsMap := rkeyMap[string(pkeys)]
@@ -505,7 +503,7 @@ func (t *tableCommon) fetchRows(ctx context.Context, lvs []*tspb.ListValue, cols
 			}
 		}
 		if err := ri.sendData(rowCells); err != nil {
-			return nil
+			return err
 		}
 	}
 
@@ -618,7 +616,6 @@ func (t *tableCommon) scanSparse(ctx context.Context, rowKeyPrefix kv.Key, cf *m
 		return nil, err
 	}
 	for iter.Valid() {
-
 		col := iter.Key()[len(recKeyPrefix):]
 		if len(col) == 0 {
 			iter.Next()

@@ -220,6 +220,58 @@ func (t *tableCommon) getCF(cfID int64) *model.ColumnFamilyMeta {
 	return nil
 }
 
+func (t *tableCommon) prepareCFColumns(rowkeys *tspb.ListValue, family string, columns []string) (cols []*columnEntry, pks []types.Datum, cfMeta *model.ColumnFamilyMeta, colmap map[string]*columnEntry, err error) {
+	_, err = CheckOnce(columns)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	cols = []*columnEntry{}
+	colmap = make(map[string]*columnEntry)
+	if family == "" {
+		family = DefaultColumnFamily
+	}
+	cf, ok := t.cfIDMap[family]
+	if !ok {
+		return nil, nil, nil, nil, status.Errorf(codes.FailedPrecondition, "cf %s not in table %s", family, t.meta.TableName)
+	}
+	cfMeta = cf
+	for j, col := range columns {
+		var entry *columnEntry
+		if !isFlexible(cf) {
+			i, ok := t.colIndex[col]
+			if !ok {
+				return nil, nil, nil, nil, status.Errorf(codes.InvalidArgument, "column %s not in table %s", col, t.meta.TableName)
+			}
+			entry = &columnEntry{
+				id:   t.Columns[i].Id,
+				name: t.Columns[i].Name,
+				t:    t.Columns[i].ColumnType,
+				cfID: t.cfIDMap[t.Columns[i].Family].Id,
+				cf:   t.Columns[i].Family,
+				ft:   t.Columns[i].FieldType,
+				idx:  j,
+			}
+		} else {
+			// Dynamic ColumnFamily
+			entry = &columnEntry{
+				name: col,
+				t:    &tspb.Type{Code: tspb.TypeCode_TYPE_CODE_UNSPECIFIED},
+				cfID: cf.Id,
+				cf:   cf.Name,
+				idx:  j,
+			}
+		}
+		cols = append(cols, entry)
+		colmap[col] = entry
+	}
+	pks, err = t.buildPrimaryKeyValues(rowkeys)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	return cols, pks, cfMeta, colmap, nil
+}
+
 //assert columns valid
 func (t *tableCommon) prepareColumns(columns []string) (cols []*columnEntry, pks []*columnEntry, cfmap map[string]map[string]*columnEntry, err error) {
 	_, err = CheckOnce(columns)
@@ -329,6 +381,8 @@ func (t *tableCommon) primaryKeyCols(cols []*columnEntry) ([]*columnEntry, error
 	}
 	return entrys, nil
 }
+
+// func (t *tableCommon) buildPrimaryKeyValues
 
 func (t *tableCommon) getCFColumns(cf *model.ColumnFamilyMeta) []string {
 	cols := []string{}

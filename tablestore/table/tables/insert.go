@@ -35,13 +35,16 @@ import (
 	tspb "github.com/zhihu/zetta-proto/pkg/tablestore"
 )
 
-func (t *tableCommon) Insert(ctx context.Context, columns []string, values []*tspb.ListValue) error {
+func (t *tableCommon) Insert(ctx context.Context, pkey *tspb.KeySet, family string, columns []string, values []*tspb.ListValue) error {
 	return status.Errorf(codes.Unimplemented, "insert not implemented yet")
 
 }
 
-func (t *tableCommon) InsertOrUpdate(ctx context.Context, columns []string, values []*tspb.ListValue) error {
-	cols, pkeys, cfmap, err := t.prepareColumns(columns)
+func (t *tableCommon) InsertOrUpdate(ctx context.Context, pkeyset *tspb.KeySet, family string, columns []string, values []*tspb.ListValue) error {
+	if pkeyset == nil {
+		return status.Errorf(codes.Canceled, "invalid pkeyset")
+	}
+	cols, pkeys, cfMeta, colmap, err := t.prepareCFColumns(pkeyset.Keys[0], family, columns)
 	if err != nil {
 		return err
 	}
@@ -50,27 +53,25 @@ func (t *tableCommon) InsertOrUpdate(ctx context.Context, columns []string, valu
 		logutil.Logger(ctx).Error("construct datum slice err", zap.Error(err))
 		return err
 	}
+
 	for _, row := range rows {
-		for cf, colmap := range cfmap {
-			cfMeta := t.cfIDMap[cf]
-			if err := t.insertCFRow(ctx, pkeys, cfMeta, colmap, row); err != nil {
-				logutil.Logger(ctx).Error("insert single row error", zap.Error(err))
-				return err
-			}
+		if err := t.insertCFRow(ctx, pkeys, cfMeta, colmap, row); err != nil {
+			logutil.Logger(ctx).Error("insert single row error", zap.Error(err))
+			return err
 		}
 	}
 	return nil
 }
 
-func (t *tableCommon) Update(ctx context.Context, cols []string, values []*tspb.ListValue) error {
+func (t *tableCommon) Update(ctx context.Context, pkey *tspb.KeySet, family string, columns []string, values []*tspb.ListValue) error {
 	return status.Errorf(codes.Unimplemented, "update not implemented yet")
 }
 
-func (t *tableCommon) Replace(ctx context.Context, cols []string, values []*tspb.ListValue) error {
+func (t *tableCommon) Replace(ctx context.Context, pkey *tspb.KeySet, family string, columns []string, values []*tspb.ListValue) error {
 	return status.Errorf(codes.Unimplemented, "replace not implemented yet")
 }
 
-func (t *tableCommon) insertCFRow(ctx context.Context, pks []*columnEntry, cf *model.ColumnFamilyMeta, colmap map[string]*columnEntry, row []types.Datum) error {
+func (t *tableCommon) insertCFRow(ctx context.Context, pks []types.Datum, cf *model.ColumnFamilyMeta, colmap map[string]*columnEntry, row []types.Datum) error {
 	var (
 		txn        = ctx.Value(sessionctx.TxnIDKey).(kv.Transaction)
 		isFlexible = isFlexible(cf)
@@ -80,8 +81,8 @@ func (t *tableCommon) insertCFRow(ctx context.Context, pks []*columnEntry, cf *m
 		logutil.Logger(ctx).Error("build key values error", zap.Error(err))
 		return err
 	}
-	for i, key := range keys {
 
+	for i, key := range keys {
 		val := vals[i]
 		if cf.Name == DefaultColumnFamily {
 			oldVal, err := txn.Get(key)
@@ -107,7 +108,7 @@ func (t *tableCommon) insertCFRow(ctx context.Context, pks []*columnEntry, cf *m
 	return nil
 }
 
-func (t *tableCommon) buildKeyValues(pks []*columnEntry, cf *model.ColumnFamilyMeta, colmap map[string]*columnEntry, row []types.Datum) ([]kv.Key, [][]byte, error) {
+func (t *tableCommon) buildKeyValues(pks []types.Datum, cf *model.ColumnFamilyMeta, colmap map[string]*columnEntry, row []types.Datum) ([]kv.Key, [][]byte, error) {
 
 	if isLayoutCompact(cf) {
 		key, val, err := t.buildKeyRowCompact(t.tableID, pks, cf, colmap, row)
@@ -132,17 +133,13 @@ func (t *tableCommon) makeColumnEntry(column string) *columnEntry {
 	return colEntry
 }
 
-func (t *tableCommon) buildKeyRowHigh(tableID int64, pks []*columnEntry, cf *model.ColumnFamilyMeta, colmap map[string]*columnEntry, row []types.Datum) ([]kv.Key, [][]byte, error) {
+func (t *tableCommon) buildKeyRowHigh(tableID int64, pks []types.Datum, cf *model.ColumnFamilyMeta, colmap map[string]*columnEntry, row []types.Datum) ([]kv.Key, [][]byte, error) {
 	var (
-		pkRow = make([]types.Datum, len(pks))
 		rkeys = make([]kv.Key, 0)
 		vals  = make([][]byte, 0)
 		sc    = &stmtctx.StatementContext{TimeZone: time.Local}
 	)
 
-	for i, pk := range pks {
-		pkRow[i] = row[pk.idx]
-	}
 	if !isFlexible(cf) {
 		columns := t.getCFColumns(cf)
 		for _, column := range columns {
@@ -155,7 +152,7 @@ func (t *tableCommon) buildKeyRowHigh(tableID int64, pks []*columnEntry, cf *mod
 	}
 
 	for col, entry := range colmap {
-		recKey, err := tablecodec.EncodeRecordKeyHigh(sc, tableID, pkRow, cf.Id, []byte(col))
+		recKey, err := tablecodec.EncodeRecordKeyHigh(sc, tableID, pks, cf.Id, []byte(col))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -173,18 +170,14 @@ func (t *tableCommon) buildKeyRowHigh(tableID int64, pks []*columnEntry, cf *mod
 	return rkeys, vals, nil
 }
 
-func (t *tableCommon) buildKeyRowCompact(tableID int64, pks []*columnEntry, cf *model.ColumnFamilyMeta, colmap map[string]*columnEntry, row []types.Datum) (kv.Key, []byte, error) {
+func (t *tableCommon) buildKeyRowCompact(tableID int64, pks []types.Datum, cf *model.ColumnFamilyMeta, colmap map[string]*columnEntry, row []types.Datum) (kv.Key, []byte, error) {
 	var (
-		pkRow   = make([]types.Datum, len(pks))
 		sc      = &stmtctx.StatementContext{TimeZone: time.Local}
 		valBody []byte
 		i       = 0
 	)
 
-	for i, pk := range pks {
-		pkRow[i] = row[pk.idx]
-	}
-	recKey, err := tablecodec.EncodeRecordKeyWide(sc, tableID, pkRow, cf.Id)
+	recKey, err := tablecodec.EncodeRecordKeyWide(sc, tableID, pks, cf.Id)
 	if err != nil {
 		logutil.Logger(context.TODO()).Error("encode wide error", zap.Error(err))
 		return nil, nil, err
@@ -229,7 +222,7 @@ func (t *tableCommon) buildKeyRowCompact(tableID int64, pks []*columnEntry, cf *
 
 }
 
-func (t *tableCommon) buildIndexForRow(ctx context.Context, pks []*columnEntry, colMap map[string]*columnEntry, row []types.Datum) error {
+func (t *tableCommon) buildIndexForRow(ctx context.Context, pks []types.Datum, colMap map[string]*columnEntry, row []types.Datum) error {
 	for _, index := range t.Indices {
 		if err := t.addIndexRow(ctx, index, pks, colMap, row); err != nil {
 			return err
@@ -238,11 +231,10 @@ func (t *tableCommon) buildIndexForRow(ctx context.Context, pks []*columnEntry, 
 	return nil
 }
 
-func (t *tableCommon) addIndexRow(ctx context.Context, index *IndexInfo, pks []*columnEntry, colMap map[string]*columnEntry, row []types.Datum) error {
+func (t *tableCommon) addIndexRow(ctx context.Context, index *IndexInfo, pks []types.Datum, colMap map[string]*columnEntry, row []types.Datum) error {
 	var (
 		sc         = &stmtctx.StatementContext{TimeZone: time.Local}
 		values     = make([]types.Datum, len(index.keys))
-		pkRow      = make([]types.Datum, len(pks))
 		colIDs     = make([]int64, len(pks))
 		indexKey   kv.Key
 		valueCodec []byte
@@ -266,13 +258,12 @@ func (t *tableCommon) addIndexRow(ctx context.Context, index *IndexInfo, pks []*
 		values = append(values, val)
 	}
 
-	for i, pk := range pks {
-		pkRow[i] = row[pk.idx]
-		colIDs[i] = pk.id
+	for i, pk := range t.pkeys {
+		colIDs[i] = pk.Id
 	}
 
 	if !index.meta.Unique {
-		keycodec, err := tablecodec.EncodeIndex(sc, t.tableID, index.ID, values, pkRow)
+		keycodec, err := tablecodec.EncodeIndex(sc, t.tableID, index.ID, values, pks)
 		if err != nil {
 			logutil.Logger(ctx).Error("encode index error", zap.Error(err))
 			return err
@@ -287,7 +278,7 @@ func (t *tableCommon) addIndexRow(ctx context.Context, index *IndexInfo, pks []*
 			return err
 		}
 		indexKey = kv.Key(keycodec)
-		valueCodec, err = tablecodec.EncodeRow(sc, pkRow, colIDs, nil, nil)
+		valueCodec, err = tablecodec.EncodeRow(sc, pks, colIDs, nil, nil)
 		if err != nil {
 			logutil.Logger(ctx).Error("encode index row value error", zap.Error(err))
 			return err

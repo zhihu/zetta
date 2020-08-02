@@ -133,3 +133,18 @@ const TxnIDKey kv.ContextKey = "transaction key"
 func SetTxnCtx(ctx context.Context, txn kv.Transaction) context.Context {
 	return context.WithValue(ctx, TxnIDKey, txn)
 }
+
+const StreamReadKey kv.ContextKey = "streamread key"
+
+func SetStreamReadKey(ctx context.Context) context.Context {
+	return context.WithValue(ctx, StreamReadKey, true)
+}
+
+func StreamReadFromContext(ctx context.Context) bool {
+	_, ok := ctx.Value(StreamReadKey).(bool)
+	if ok {
+		return true
+	}
+	return false
+
+}

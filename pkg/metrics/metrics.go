@@ -114,6 +114,12 @@ func RegisterMetrics() {
 	prometheus.MustRegister(FetchSparseCounter)
 	prometheus.MustRegister(FetchRowsDuration)
 	prometheus.MustRegister(FetchSparseDuration)
+
+	prometheus.MustRegister(ScanSparseCounter)
+	prometheus.MustRegister(ScanSparseDuration)
+
+	prometheus.MustRegister(BatchSparseCounter)
+	prometheus.MustRegister(BatchSparseDuration)
 }
 
 // Label constants.

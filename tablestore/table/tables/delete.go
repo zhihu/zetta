@@ -42,11 +42,14 @@ type deleteOptions struct {
 	pkfts     []*types.FieldType
 }
 
-func (t *tableCommon) Delete(ctx context.Context, keySet *tspb.KeySet, columns []string) error {
-	delOpts, err := t.prepareDeleteOptions(ctx, columns)
+func (t *tableCommon) Delete(ctx context.Context, keySet *tspb.KeySet, family string, columns []string) error {
+
+	// delOpts, err := t.prepareDeleteOptions(ctx, columns)
+	delOpts, err := t.prepareDeleteCFOptions(ctx, family, columns)
 	if err != nil {
 		return err
 	}
+
 	if all := keySet.GetAll(); all {
 		return t.dropTableData(ctx, delOpts)
 	}
@@ -64,6 +67,49 @@ func (t *tableCommon) Delete(ctx context.Context, keySet *tspb.KeySet, columns [
 		}
 	}
 	return nil
+}
+
+func (t *tableCommon) prepareDeleteCFOptions(ctx context.Context, family string, columns []string) (*deleteOptions, error) {
+	var (
+		fields   = make([]*columnEntry, 0)
+		cfmap    = make(map[string]*model.ColumnFamilyMeta)
+		cfColMap = make(map[string]map[string]int)
+	)
+	if family == "" {
+		family = DefaultColumnFamily
+	}
+	cf, ok := t.cfIDMap[family]
+	if !ok {
+		return nil, status.Errorf(codes.FailedPrecondition, "cf %s not in table %s", family, t.meta.TableName)
+	}
+	cfmap[family] = cf
+	cfColMap[family] = make(map[string]int)
+
+	delOpts := &deleteOptions{
+		pkfts:    t.buildPrimaryKeyFieldTypes(),
+		cfmap:    cfmap,
+		cfColMap: cfColMap,
+	}
+
+	if len(columns) == 0 {
+		delOpts.RowDelete = true
+		return delOpts, nil
+	}
+
+	if isFlexible(cf) {
+		for _, col := range columns {
+			colEntry := &columnEntry{
+				name: col,
+				t:    &tspb.Type{Code: tspb.TypeCode_TYPE_CODE_UNSPECIFIED},
+				ft:   nil,
+				cfID: cf.Id,
+				cf:   cf.Name,
+			}
+			fields = append(fields, colEntry)
+		}
+	}
+	delOpts.fields = fields
+	return delOpts, nil
 }
 
 func (t *tableCommon) prepareDeleteOptions(ctx context.Context, columns []string) (*deleteOptions, error) {
@@ -497,8 +543,7 @@ func (t *tableCommon) deleteSingleKey(ctx context.Context, recordKey kv.Key) err
 
 func (t *tableCommon) dropTableData(ctx context.Context, delOpts *deleteOptions) error {
 	if delOpts.RowDelete {
-		tablePrefix := tablecodec.EncodeTablePrefix(t.tableID)
-		return t.deleteKeys(ctx, tablePrefix, tablePrefix.PrefixNext())
+		return t.dropSpecificCFRow(ctx, delOpts)
 	}
 	return t.dropSpecificFlexibleColumn(ctx, delOpts)
 }
@@ -533,6 +578,36 @@ func (t *tableCommon) dropSpecificFlexibleColumn(ctx context.Context, delOpts *d
 	return nil
 }
 
+func (t *tableCommon) dropSpecificCFRow(ctx context.Context, delOpts *deleteOptions) error {
+	var (
+		txn         = ctx.Value(sessionctx.TxnIDKey).(kv.Transaction)
+		tablePrefix = tablecodec.EncodeTablePrefix(t.tableID)
+	)
+	iter, err := txn.Iter(tablePrefix, tablePrefix.PrefixNext())
+	if err != nil {
+		logutil.Logger(ctx).Error("locate key range error", zap.Error(err))
+		return err
+	}
+	defer iter.Close()
+	for iter.Valid() {
+		_, _, cfID, _, err := tablecodec.DecodeRecordKey(iter.Key(), delOpts.pkfts, time.Local)
+		if err != nil {
+			logutil.Logger(ctx).Error("decode record key error", zap.Error(err), zap.String("table", t.Meta().TableName))
+			return err
+		}
+		for _, cfMeta := range delOpts.cfmap {
+			if cfMeta.Id == cfID {
+				if err := txn.Delete(iter.Key()); err != nil {
+					logutil.Logger(ctx).Error("remove key error", zap.Error(err), zap.String("key", string(iter.Key())), zap.String("cf", cfMeta.Name))
+					return err
+				}
+			}
+		}
+		iter.Next()
+	}
+	return nil
+}
+
 func (t *tableCommon) deleteKeys(ctx context.Context, k, upperBound kv.Key) error {
 	txn := ctx.Value(sessionctx.TxnIDKey).(kv.Transaction)
 	iter, err := txn.Iter(k, upperBound)
@@ -543,6 +618,7 @@ func (t *tableCommon) deleteKeys(ctx context.Context, k, upperBound kv.Key) erro
 	defer iter.Close()
 	for iter.Valid() {
 		//TODO: verify this delete procedure
+
 		if err := txn.Delete(iter.Key()); err != nil {
 			logutil.Logger(ctx).Error("remove key error", zap.Error(err), zap.String("key", string(iter.Key())))
 			return err

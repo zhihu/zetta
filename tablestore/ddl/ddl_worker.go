@@ -47,16 +47,10 @@ type workerType byte
 const (
 	// generalWorker is the worker who handles all DDL statements except “add index”.
 	generalWorker workerType = 0
-	// addIdxWorker is the worker who handles the operation of adding indexes.
-	addIdxWorker workerType = 1
-	// waitDependencyJobInterval is the interval when the dependency job doesn't be done.
-	waitDependencyJobInterval = 200 * time.Millisecond
-	// noneDependencyJob means a job has no dependency-job.
-	noneDependencyJob = 0
 )
 
 // worker is used for handling DDL jobs.
-// Now we have two kinds of workers.
+// We only use one kind of worker now.
 type worker struct {
 	id       int32
 	tp       workerType
@@ -84,8 +78,6 @@ func (w *worker) typeStr() string {
 	switch w.tp {
 	case generalWorker:
 		str = "general"
-	case addIdxWorker:
-		str = "add-index"
 	default:
 		str = "unknow"
 	}
@@ -102,8 +94,17 @@ func (w *worker) start(d *ddlCtx) {
 	logutil.Logger(w.logCtx).Info("[ddl] start DDL worker")
 	defer w.wg.Done()
 
+	// We use 4 * lease time to check owner's timeout, so here, we will update owner's status
+	// every 2 * lease time. If lease is 0, we will use default 1s.
+	// But we use etcd to speed up, normally it takes less than 1s now, so we use 1s as the max value.
+	checkTime := chooseLeaseTime(2*d.lease, 1*time.Second)
+
+	ticker := time.NewTicker(checkTime)
+	defer ticker.Stop()
+
 	for {
 		select {
+		case <-ticker.C:
 		case <-w.ddlJobCh:
 		case <-w.quitCh:
 			return
@@ -119,8 +120,14 @@ func (w *worker) start(d *ddlCtx) {
 // handleDDLJobQueue handles DDL jobs in DDL Job queue.
 func (w *worker) handleDDLJobQueue(d *ddlCtx) error {
 	once := true
+	var t *meta.Meta
+	getJob := func(txn kv.Transaction) (*model.Job, error) {
+		t = newMetaWithQueueTp(txn, w.typeStr())
+		return w.getFirstDDLJob(t)
+	}
 	for {
-		if isChanClosed(w.quitCh) {
+		// We are not owner, return and retry checking later.
+		if isChanClosed(w.quitCh) || !d.isOwner() {
 			return nil
 		}
 
@@ -131,19 +138,13 @@ func (w *worker) handleDDLJobQueue(d *ddlCtx) error {
 		)
 		waitTime := 2 * d.lease
 		err := kv.RunInNewTxn(d.store, false, func(txn kv.Transaction) error {
-			// We are not owner, return and retry checking later.
-			if !d.isOwner() {
-				return nil
-			}
-
 			var err error
-			t := newMetaWithQueueTp(txn, w.typeStr())
-			// We become the owner. Get the first job and run it.
-			job, err = w.getFirstDDLJob(t)
+			job, err = getJob(txn)
 			if job == nil || err != nil {
 				return errors.Trace(err)
 			}
 			logutil.Logger(ddlLogCtx).Info("[ddl] start DDL job in worker", zap.String("job", job.String()), zap.String("query", job.Query))
+			//
 			if once {
 				w.waitSchemaSynced(d, job, waitTime)
 				once = false
@@ -157,10 +158,6 @@ func (w *worker) handleDDLJobQueue(d *ddlCtx) error {
 				err = w.finishDDLJob(t, job)
 				return errors.Trace(err)
 			}
-
-			d.mu.RLock()
-			d.mu.hook.OnJobRunBefore(job)
-			d.mu.RUnlock()
 
 			// If running job meets error, we will save this error in job Error
 			// and retry later if the job is not cancelled.
@@ -199,10 +196,6 @@ func (w *worker) handleDDLJobQueue(d *ddlCtx) error {
 			// No job now, return and retry getting later.
 			return nil
 		}
-
-		d.mu.RLock()
-		d.mu.hook.OnJobUpdated(job)
-		d.mu.RUnlock()
 
 		// Here means the job enters another state (delete only, write only, public, etc...) or is cancelled.
 		// If the job is done or still running or rolling back, we will wait 2 * lease time to guarantee other servers to update
@@ -249,6 +242,8 @@ func (w *worker) runDDLJob(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, 
 		ver, err = onCreateTable(d, t, job)
 	case model.ActionDropTable:
 		ver, err = onDropTableOrView(t, job)
+	case model.ActionAddColumn:
+		ver, err = onAddColumn(d, t, job)
 	case model.ActionAddIndex:
 		ver, err = onAddIndex(d, t, job)
 	default:
@@ -428,9 +423,6 @@ func asyncNotify(ch chan struct{}) {
 }
 
 func newMetaWithQueueTp(txn kv.Transaction, tp string) *meta.Meta {
-	//if tp == model.AddIndexStr || tp == model.AddPrimaryKeyStr {
-	//	return meta.NewMeta(txn, meta.AddIndexJobListKey)
-	//}
 	return meta.NewMeta(txn)
 }
 

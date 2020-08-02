@@ -138,9 +138,9 @@ type Table interface {
 	IndexPrefix() kv.Key
 
 	// Insert inserts a row.
-	Insert(ctx context.Context, columns []string, values []*tspb.ListValue) error
+	Insert(ctx context.Context, pkeys *tspb.KeySet, family string, columns []string, values []*tspb.ListValue) error
 
-	InsertOrUpdate(ctx context.Context, columns []string, values []*tspb.ListValue) error
+	InsertOrUpdate(ctx context.Context, pkeys *tspb.KeySet, family string, columns []string, values []*tspb.ListValue) error
 
 	// Meta returns TableInfo.
 	Meta() *model.TableMeta

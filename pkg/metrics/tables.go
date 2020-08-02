@@ -49,4 +49,38 @@ var (
 			Help:      "Bucketed histogram of processing time (s) in running mutate executor.",
 			Buckets:   prometheus.ExponentialBuckets(0.0001, 2, 22), // 100us ~ 419s
 		}, []string{LblType})
+
+	BatchSparseCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "zetta",
+			Subsystem: "tables",
+			Name:      "batch_sparse_total",
+			Help:      "Counter of batchSparse.",
+		}, []string{LblType})
+
+	ScanSparseCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "zetta",
+			Subsystem: "tables",
+			Name:      "scan_sparse_total",
+			Help:      "Counter of scanSparse.",
+		}, []string{LblType})
+
+	BatchSparseDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "zetta",
+			Subsystem: "tables",
+			Name:      "batch_sparse_duration_seconds",
+			Help:      "Bucketed histogram of processing time (s) in running mutate executor.",
+			Buckets:   prometheus.ExponentialBuckets(0.0001, 2, 22), // 100us ~ 419s
+		}, []string{LblType})
+
+	ScanSparseDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "zetta",
+			Subsystem: "tables",
+			Name:      "scan_sparse_duration_seconds",
+			Help:      "Bucketed histogram of processing time (s) in running mutate executor.",
+			Buckets:   prometheus.ExponentialBuckets(0.0001, 2, 22), // 100us ~ 419s
+		}, []string{LblType})
 )

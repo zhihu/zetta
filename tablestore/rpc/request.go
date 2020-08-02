@@ -35,6 +35,6 @@ type readRequest struct {
 	*tspb.ReadRequest
 }
 
-type sparseReadRequest struct {
+type SparseReadRequest struct {
 	*tspb.SparseReadRequest
 }
