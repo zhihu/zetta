@@ -34,7 +34,6 @@ require (
 	go.uber.org/zap v1.10.0
 	golang.org/x/sys v0.0.0-20191220220014-0732a990476f // indirect
 	google.golang.org/grpc v1.25.1
-	gopkg.in/alexcesaro/statsd.v2 v2.0.0
 	sourcegraph.com/sourcegraph/appdash-data v0.0.0-20151005221446-73f23eafcf67
 
 )

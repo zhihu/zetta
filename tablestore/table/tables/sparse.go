@@ -252,11 +252,6 @@ func (t *tableCommon) readSparseBatch(ctx context.Context, rowKeys []kv.Key, cel
 }
 
 func (t *tableCommon) scanSparseRow(ctx context.Context, srows []*sparseRow, cf *model.ColumnFamilyMeta, ri *resultIter) error {
-	metrics.MetricCount("scan_sparse_row")
-	tm := metrics.MetricStartTiming()
-	defer func() {
-		metrics.MetricRecordTiming(tm, "scan_sparse_row")
-	}()
 	var (
 		txn        = ctx.Value(sessionctx.TxnIDKey).(kv.Transaction)
 		sc         = &stmtctx.StatementContext{TimeZone: time.Local}
@@ -305,7 +300,6 @@ func (t *tableCommon) scanSparseRow(ctx context.Context, srows []*sparseRow, cf 
 			}
 		}
 	}
-	// metrics.MetricRecordTiming(tm, "scan_sparse_row")
 	return nil
 }
 
