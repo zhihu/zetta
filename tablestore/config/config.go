@@ -245,7 +245,7 @@ var defaultConf = Config{
 	AdvertiseAddress: "",
 	Port:             4000,
 	Store:            "mocktikv",
-	Path:             "/tmp/zetta/",
+	Path:             "/tmp/",
 
 	MaxSessions: 10000,
 	Log: Log{

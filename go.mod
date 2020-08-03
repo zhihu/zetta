@@ -19,7 +19,7 @@ require (
 	github.com/pingcap/failpoint v0.0.0-20190512135322-30cc7431d99c
 	github.com/pingcap/log v0.0.0-20190715063458-479153f07ebd
 	github.com/pingcap/parser v0.0.0-20191120072812-9dc33a611210
-	github.com/pingcap/tidb v3.0.6+incompatible
+	github.com/pingcap/tidb v1.1.0-beta.0.20191122095600-76f0386c5a17
 	github.com/pingcap/tidb-tools v3.0.6-0.20191119150227-ff0a3c6e5763+incompatible
 	github.com/pingcap/tipb v0.0.0-20191120045257-1b9900292ab6
 	github.com/pkg/errors v0.8.1
@@ -29,7 +29,7 @@ require (
 	github.com/stretchr/testify v1.4.0 // indirect
 	github.com/tiancaiamao/appdash v0.0.0-20181126055449-889f96f722a2
 	github.com/uber/jaeger-client-go v2.15.0+incompatible
-	github.com/zhihu/zetta-proto v0.0.0-20200602094047-43d62f6b0dc7
+	github.com/zhihu/zetta-proto v0.0.0-20200801112337-dd6ec18688aa
 	go.etcd.io/etcd v0.0.0-20190320044326-77d4b742cdbf
 	go.uber.org/zap v1.10.0
 	golang.org/x/sys v0.0.0-20191220220014-0732a990476f // indirect

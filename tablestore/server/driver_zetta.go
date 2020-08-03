@@ -23,13 +23,13 @@ import (
 
 // ZettaDriver implements IDriver.
 type ZettaDriver struct {
-	store kv.Storage
+	Store kv.Storage
 }
 
 // NewZettaDriver creates a new ZettaDriver
 func NewZettaDriver(store kv.Storage) *ZettaDriver {
 	driver := &ZettaDriver{
-		store: store,
+		Store: store,
 	}
 	return driver
 }
@@ -64,7 +64,7 @@ func (zc *ZettaContext) SetValue(key fmt.Stringer, value interface{}) {
 
 // OpenCtx xxx
 func (zd *ZettaDriver) OpenCtx(connId uint64, dbname string) (QueryCtx, error) {
-	se, err := session.CreateSession(zd.store)
+	se, err := session.CreateSession(zd.Store)
 	if err != nil {
 		return nil, err
 	}

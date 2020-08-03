@@ -77,7 +77,7 @@ func (s *session) HandleMutate(ctx context.Context, req rpc.MutationRequest, txn
 			if err != nil {
 				return nil, err
 			}
-			if err := ztable.Insert(ctx, insert.Columns, insert.Values); err != nil {
+			if err := ztable.Insert(ctx, insert.KeySet, insert.Family, insert.Columns, insert.Values); err != nil {
 				logutil.Logger(ctx).Error("mutation insert error", zap.Error(err))
 				return nil, err
 			}
@@ -88,18 +88,18 @@ func (s *session) HandleMutate(ctx context.Context, req rpc.MutationRequest, txn
 			if err != nil {
 				return nil, err
 			}
-			if err := ztable.Delete(ctx, del.GetKeySet(), del.Columns); err != nil {
+			if err := ztable.Delete(ctx, del.GetKeySet(), del.Family, del.Columns); err != nil {
 				logutil.Logger(ctx).Error("mutation delete error", zap.Error(err))
 				return nil, err
 			}
 		case *tspb.Mutation_InsertOrUpdate:
 			iou := op.InsertOrUpdate
 			ztable, err := s.prepareZettaTable(ctx, iou.Table)
-
 			if err != nil {
 				return nil, err
 			}
-			if err := ztable.InsertOrUpdate(ctx, iou.Columns, iou.Values); err != nil {
+
+			if err := ztable.InsertOrUpdate(ctx, iou.KeySet, iou.Family, iou.Columns, iou.Values); err != nil {
 				logutil.Logger(ctx).Error("mutation insert-or-update error", zap.Error(err))
 				return nil, err
 			}
@@ -110,7 +110,7 @@ func (s *session) HandleMutate(ctx context.Context, req rpc.MutationRequest, txn
 			if err != nil {
 				return nil, err
 			}
-			if err := ztable.Update(ctx, up.Columns, up.Values); err != nil {
+			if err := ztable.Update(ctx, up.KeySet, up.Family, up.Columns, up.Values); err != nil {
 				logutil.Logger(ctx).Error("mutation update error", zap.Error(err))
 				return nil, err
 			}
@@ -121,7 +121,7 @@ func (s *session) HandleMutate(ctx context.Context, req rpc.MutationRequest, txn
 			if err != nil {
 				return nil, err
 			}
-			if err := ztable.Replace(ctx, replace.Columns, replace.Values); err != nil {
+			if err := ztable.Replace(ctx, replace.KeySet, replace.Family, replace.Columns, replace.Values); err != nil {
 				logutil.Logger(ctx).Error("mutation replace error", zap.Error(err))
 				return nil, err
 			}

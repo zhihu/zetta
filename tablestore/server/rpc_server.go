@@ -16,6 +16,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,19 +28,18 @@ import (
 
 	emptypb "github.com/gogo/protobuf/types"
 
-	"github.com/grpc-ecosystem/go-grpc-middleware"
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_opentracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
-	"github.com/grpc-ecosystem/go-grpc-prometheus"
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 
 	"github.com/pingcap/tidb/util/logutil"
-	"github.com/pingcap/tidb/util/mock"
 
 	tspb "github.com/zhihu/zetta-proto/pkg/tablestore"
 	"github.com/zhihu/zetta/pkg/metrics"
-	"github.com/zhihu/zetta/pkg/model"
 	"github.com/zhihu/zetta/tablestore/domain"
 	"github.com/zhihu/zetta/tablestore/rpc"
 	"github.com/zhihu/zetta/tablestore/session"
+	"github.com/zhihu/zetta/tablestore/sessionctx"
 )
 
 var (
@@ -406,7 +406,6 @@ func (rs *RPCServer) readStream(ctx context.Context, ri session.RecordSet, send 
 		}
 		prs := &tspb.PartialResultSet{
 			Metadata: rsm,
-
 			RowCells: row.(*tspb.SliceCell),
 		}
 		if err = send(prs); err != nil {
@@ -417,7 +416,7 @@ func (rs *RPCServer) readStream(ctx context.Context, ri session.RecordSet, send 
 	}
 	durRead := time.Since(startTS)
 
-	if ri.LastErr() != nil || err != nil {
+	if ri.LastErr() != nil || (err != nil && err != io.EOF) {
 		streamReadCounterGerneralErr.Inc()
 		executeReadDurationGeneralErr.Observe(durRead.Seconds())
 		if ri.LastErr() != nil {
@@ -428,6 +427,32 @@ func (rs *RPCServer) readStream(ctx context.Context, ri session.RecordSet, send 
 	executeReadDurationGeneralOK.Observe(durRead.Seconds())
 	streamReadCounterGerneralOK.Inc()
 	return nil
+}
+
+// StreamingSparseRead xxx
+func (rs *RPCServer) StreamingSparseRead(req *tspb.SparseReadRequest, stream tspb.Tablestore_StreamingSparseReadServer) error {
+	queryCtx, err := rs.getQueryCtxBySessionID(req.Session)
+	if err != nil {
+		streamReadCounterGerneralErr.Inc()
+		return err
+	}
+	session := queryCtx.GetSession()
+	session.SetLastActive(time.Now())
+	txn, err := session.RetrieveTxn(stream.Context(), req.GetTransaction(), false)
+	if err != nil {
+		streamReadCounterGerneralErr.Inc()
+		logutil.Logger(stream.Context()).Error("fetch transaction error", zap.Error(err))
+		return err
+	}
+	ctx := sessionctx.SetStreamReadKey(stream.Context())
+	ri, err := queryCtx.GetSession().HandleRead(ctx, req, txn)
+	if err != nil {
+		streamReadCounterGerneralErr.Inc()
+		logutil.Logger(stream.Context()).Error("mutate error", zap.Error(err))
+		return status.Error(codes.Aborted, err.Error())
+	}
+
+	return rs.readStream(ctx, ri, stream.Send)
 }
 
 // BeginTransaction begins a new transaction. This step can often be skipped:
@@ -528,117 +553,9 @@ func (rs *RPCServer) getQueryCtxBySessionID(id string) (QueryCtx, error) {
 	defer rs.s.rwlock.RUnlock()
 	queryCtx, ok := rs.s.queryCtxs[id]
 	if !ok {
-		return nil, status.Errorf(codes.NotFound, "session %s not found", id)
+		return nil, status.Errorf(codes.NotFound, "Session not found:session %s not found", id)
 	}
 	return queryCtx, nil
-}
-
-// CreateDatabase xxx
-func (rs *RPCServer) CreateDatabase(ctx context.Context, req *tspb.CreateDatabaseRequest) (*tspb.CreateDatabaseResponse, error) {
-	do := domain.GetOnlyDomain()
-	dbMeta := model.NewDatabaseMetaFromPbReq(req)
-	sctx := mock.NewContext() // Use mock to provide a default session context.
-	err := do.DDL().CreateSchema(sctx, dbMeta)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, err.Error())
-	}
-	return &tspb.CreateDatabaseResponse{}, nil
-}
-
-// DeleteDatabase xxx
-func (rs *RPCServer) DeleteDatabase(ctx context.Context, req *tspb.DeleteDatabaseRequest) (*tspb.DeleteDatabaseResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method DeleteDatabase not implemented")
-}
-
-func (rs *RPCServer) ListDatabase(ctx context.Context, req *tspb.ListDatabaseRequest) (*tspb.ListDatabaseResponse, error) {
-	dbMetas := make([]*tspb.DatabaseMeta, 0)
-	do := domain.GetOnlyDomain()
-	dbs := do.InfoSchema().ListDatabases()
-	for _, d := range dbs {
-		dbMetas = append(dbMetas, &d.DatabaseMeta)
-	}
-	return &tspb.ListDatabaseResponse{
-		Databases: dbMetas,
-	}, nil
-}
-
-// CreateTable xxx
-func (rs *RPCServer) CreateTable(ctx context.Context, req *tspb.CreateTableRequest) (*tspb.CreateTableResponse, error) {
-	do := domain.GetOnlyDomain()
-	tbMeta := model.NewTableMetaFromPbReq(req)
-	fmt.Println(tbMeta)
-	sctx := mock.NewContext() // Use mock to provide a default session context.
-	err := do.DDL().CreateTable(sctx, tbMeta)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, err.Error())
-	}
-	return &tspb.CreateTableResponse{}, nil
-}
-
-func (rs *RPCServer) AddColumn(ctx context.Context, req *tspb.AddColumnRequest) (*tspb.AddColumnResponse, error) {
-	do := domain.GetOnlyDomain()
-	sctx := mock.NewContext()
-	err := do.DDL().AddColumn(sctx, req)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, err.Error())
-	}
-	return &tspb.AddColumnResponse{}, nil
-}
-
-func (rs *RPCServer) ListTables(ctx context.Context,
-	req *tspb.ListTableByDatabaseRequest) (*tspb.ListTableByDatabaseResponse, error) {
-	do := domain.GetOnlyDomain()
-	database := req.Database
-	tbls := do.InfoSchema().ListTablesByDatabase(database)
-	res := &tspb.ListTableByDatabaseResponse{}
-	for _, t := range tbls {
-		pbTable := t.TableMeta
-		columns := make([]*tspb.ColumnMeta, 0)
-		columnFamilies := make([]*tspb.ColumnFamilyMeta, 0)
-		for _, c := range t.Columns {
-			columns = append(columns, &c.ColumnMeta)
-		}
-		for _, cf := range t.ColumnFamilies {
-			columnFamilies = append(columnFamilies, &cf.ColumnFamilyMeta)
-		}
-		pbTable.Columns = columns
-		pbTable.ColumnFamilies = columnFamilies
-		res.Tables = append(res.Tables, &pbTable)
-	}
-	return res, nil
-}
-
-// DropTable xxx
-func (rs *RPCServer) DropTable(ctx context.Context, req *tspb.DropTableRequest) (*tspb.DropTableResponse, error) {
-	do := domain.GetOnlyDomain()
-	sctx := mock.NewContext()
-	err := do.DDL().DropTable(sctx, req.Database, req.Table)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, err.Error())
-	}
-	return &tspb.DropTableResponse{}, nil
-}
-
-// AlterTable xxx
-func (rs *RPCServer) AlterTable(ctx context.Context, req *tspb.AlterTableRequest) (*tspb.AlterTableResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method AlterTable not implemented")
-}
-
-// CreateIndex xxx
-func (rs *RPCServer) CreateIndex(ctx context.Context, req *tspb.CreateIndexRequest) (*tspb.CreateIndexResponse, error) {
-	do := domain.GetOnlyDomain()
-	indexMeta := model.NewIndexMetaFromPbReq(req)
-	sctx := mock.NewContext()
-	err := do.DDL().CreateIndex(sctx, req.Database, req.Table, indexMeta)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, err.Error())
-	}
-	return &tspb.CreateIndexResponse{}, nil
-}
-
-// DropIndex xxx
-func (rs *RPCServer) DropIndex(ctx context.Context, req *tspb.DropIndexRequest) (*tspb.DropIndexResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method DropIndex not implemented")
 }
 
 func zettaResultFromResult(x interface{}) (*tspb.ResultSet, error) {

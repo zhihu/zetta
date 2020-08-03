@@ -263,6 +263,11 @@ func buildTableInfoWithCheck(ctx sessionctx.Context, ddl *ddl, db *model.Databas
 	return tb, nil
 }
 
+func addColumn(tbInfo *model.TableMeta, col *model.ColumnMeta) {
+	col.Id = allocateColumnID(tbInfo)
+	tbInfo.Columns = append(tbInfo.Columns, col)
+}
+
 func getPartitionIDs(table *model.TableMeta) []int64 {
 	return []int64{}
 }

@@ -66,14 +66,16 @@ var (
 // InfoSchema to get schema info from memory.
 type InfoSchema interface {
 	GetDatabaseMetaByName(name string) (*model.DatabaseMeta, bool)
-	ListDatabases() []*model.DatabaseMeta
 	GetTableMetaByName(db, name string) (*model.TableMeta, error)
 	GetTableByName(db, name string) (table.Table, error)
+
 	ListTablesByDatabase(db string) []*model.TableMeta
+	ListDatabases() []*model.DatabaseMeta
+
 	SchemaMetaVersion() int64
 	SchemaExists(name string) bool
-	TableExists(db, table string) bool
 	SchemaByID(id int64) (*model.DatabaseMeta, bool)
+	TableExists(db, table string) bool
 
 	LoadAllFromMeta(m *meta.Meta) error
 }

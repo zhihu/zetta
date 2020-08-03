@@ -37,21 +37,12 @@ import (
 	tspb "github.com/zhihu/zetta-proto/pkg/tablestore"
 	"github.com/zhihu/zetta/pkg/model"
 	"github.com/zhihu/zetta/tablestore/infoschema"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 func (d *ddl) CreateSchema(ctx sessionctx.Context, dbMeta *model.DatabaseMeta) (err error) {
-	is := d.GetInfoSchemaWithInterceptor(ctx)
-	_, ok := is.GetDatabaseMetaByName(dbMeta.Database)
-	if ok {
-		return infoschema.ErrDatabaseExists.GenWithStackByArgs(dbMeta.Database)
-	}
-
-	if err = checkTooLongSchema(dbMeta.Database); err != nil {
+	if err = d.schemaValidate(ctx, dbMeta); err != nil {
 		return errors.Trace(err)
 	}
-
 	genIDs, err := d.genGlobalIDs(1)
 	if err != nil {
 		return errors.Trace(err)
@@ -70,70 +61,146 @@ func (d *ddl) CreateSchema(ctx sessionctx.Context, dbMeta *model.DatabaseMeta) (
 	return errors.Trace(err)
 }
 
-func checkTooLongSchema(schema string) error {
-	if len(schema) > mysql.MaxDatabaseNameLength {
-		return ErrTooLongIdent.GenWithStackByArgs(schema)
+func (d *ddl) schemaValidate(ctx sessionctx.Context, dbMeta *model.DatabaseMeta) error {
+	var err error
+	is := d.GetInfoSchemaWithInterceptor(ctx)
+	_, ok := is.GetDatabaseMetaByName(dbMeta.Database)
+	if ok {
+		return infoschema.ErrDatabaseExists.GenWithStackByArgs(dbMeta.Database)
+	}
+	checkTooLongSchema := func(schema string) error {
+		if len(schema) > mysql.MaxDatabaseNameLength {
+			return ErrTooLongIdent.GenWithStackByArgs(schema)
+		}
+		return nil
+	}
+	if err = checkTooLongSchema(dbMeta.Database); err != nil {
+		return errors.Trace(err)
 	}
 	return nil
 }
 
-func (d *ddl) CreateIndex(ctx sessionctx.Context, db, table string, indexMeta *model.IndexMeta) (err error) {
+func (d *ddl) indexValidate(ctx sessionctx.Context, db, table string, indexMeta *model.IndexMeta) (int64, int64, error) {
+	var (
+		dbid int64
+		tbid int64
+		err  error
+	)
 	is := d.GetInfoSchemaWithInterceptor(ctx)
 	dbMeta, ok := is.GetDatabaseMetaByName(db)
 	if !ok {
-		return infoschema.ErrDatabaseNotExists.GenWithStackByArgs(dbMeta.Database)
+		return dbid, tbid, infoschema.ErrDatabaseNotExists.GenWithStackByArgs(dbMeta.Database)
 	}
 	tbMeta, err := is.GetTableMetaByName(db, table)
-	if tbMeta == nil {
-		return infoschema.ErrTableNotExists.GenWithStackByArgs()
+	if err != nil {
+		return dbid, tbid, infoschema.ErrTableNotExists.GenWithStackByArgs()
 	}
 	if i := tbMeta.FindIndexByName(indexMeta.Name); i != nil {
-		return ErrDupKeyName.GenWithStack("index already exist %s", indexMeta.Name)
+		return dbid, tbid, ErrDupKeyName.GenWithStack("index already exist %s", indexMeta.Name)
 	}
+	return dbMeta.Id, tbMeta.Id, nil
+}
 
+func (d *ddl) CreateIndex(ctx sessionctx.Context, db, table string, indexMeta *model.IndexMeta) error {
+	var (
+		dbid int64
+		tbid int64
+		err  error
+	)
+	if dbid, tbid, err = d.indexValidate(ctx, db, table, indexMeta); err != nil {
+		return errors.Trace(err)
+	}
 	job := &model.Job{
-		SchemaID:   dbMeta.Id,
-		TableID:    tbMeta.Id,
+		SchemaID:   dbid,
+		TableID:    tbid,
 		Type:       model.ActionAddIndex,
 		BinlogInfo: &model.HistoryInfo{},
 		Args:       []interface{}{indexMeta},
 	}
-
 	err = d.doDDLJob(ctx, job)
 	return errors.Trace(err)
 }
 
-func (d *ddl) AddColumn(ctx sessionctx.Context, req *tspb.AddColumnRequest) (err error) {
-	return nil
+func (d *ddl) AddColumn(ctx sessionctx.Context, req *tspb.AddColumnRequest) error {
+	var (
+		dbid int64
+		tbid int64
+		err  error
+	)
+	if dbid, tbid, err = d.columnValidate(ctx, req); err != nil {
+		return errors.Trace(err)
+	}
+	job := &model.Job{
+		State:      model.JobStateNone,
+		SchemaID:   dbid,
+		TableID:    tbid,
+		Type:       model.ActionAddColumn,
+		BinlogInfo: &model.HistoryInfo{},
+		Args:       []interface{}{req.Columns},
+	}
+
+	return d.doDDLJob(ctx, job)
 }
 
-func (d *ddl) CreateTable(ctx sessionctx.Context, tbMeta *model.TableMeta) (err error) {
-	is := d.GetInfoSchemaWithInterceptor(ctx)
-	if tbMeta.Database == "" {
-		return status.Errorf(codes.FailedPrecondition, "database should be specific")
+func (d *ddl) columnValidate(ctx sessionctx.Context, req *tspb.AddColumnRequest) (int64, int64, error) {
+	var (
+		dbid int64
+		tbid int64
+		err  error
+	)
+	is := d.infoHandle.Get()
+	db, ok := is.GetDatabaseMetaByName(req.Database)
+	if !ok {
+		return dbid, tbid, infoschema.ErrDatabaseNotExists.GenWithStackByArgs(db.Database)
 	}
+	tbMeta, err := is.GetTableMetaByName(req.Database, req.Table)
+	if err != nil {
+		return dbid, tbid, infoschema.ErrTableNotExists.GenWithStackByArgs()
+	}
+	for _, c := range req.Columns {
+		if col := tbMeta.FindColumnByName(c.Name); col != nil {
+			return dbid, tbid, infoschema.ErrColumnExists.GenWithStackByArgs(c.Name)
+		}
+	}
+	return db.Id, tbMeta.Id, nil
+}
+
+func (d *ddl) tableValidate(ctx sessionctx.Context, tbMeta *model.TableMeta) (int64, int64, error) {
+	var (
+		dbid int64
+		tbid int64
+		err  error
+	)
+	is := d.GetInfoSchemaWithInterceptor(ctx)
 	db, ok := is.GetDatabaseMetaByName(tbMeta.Database)
 	if !ok {
-		return infoschema.ErrDatabaseNotExists.GenWithStackByArgs(db.Database)
+		return dbid, tbid, infoschema.ErrDatabaseNotExists.GenWithStackByArgs(db.Database)
 	}
 	if is.TableExists(tbMeta.Database, tbMeta.TableName) {
-		return infoschema.ErrTableExists.GenWithStackByArgs()
+		return dbid, tbid, infoschema.ErrTableExists.GenWithStackByArgs()
 	}
 
 	tbMeta, err = buildTableInfoWithCheck(ctx, d, db, tbMeta)
 	if err != nil {
+		return dbid, tbid, errors.Trace(err)
+	}
+	err = checkTableInfoValid(tbMeta)
+	return db.Id, tbMeta.Id, err
+}
+
+func (d *ddl) CreateTable(ctx sessionctx.Context, tbMeta *model.TableMeta) error {
+	var (
+		dbid int64
+		tbid int64
+		err  error
+	)
+	if dbid, tbid, err = d.tableValidate(ctx, tbMeta); err != nil {
 		return errors.Trace(err)
 	}
-	tbMeta.State = model.StatePublic
-	err = checkTableInfoValid(tbMeta)
-	if err != nil {
-		return err
-	}
 	tbMeta.State = model.StateNone
-
 	job := &model.Job{
-		SchemaID:   db.Id,
-		TableID:    tbMeta.Id,
+		SchemaID:   dbid,
+		TableID:    tbid,
 		Type:       model.ActionCreateTable,
 		BinlogInfo: &model.HistoryInfo{},
 		Args:       []interface{}{tbMeta},
@@ -158,6 +225,5 @@ func (d *ddl) DropTable(ctx sessionctx.Context, db, table string) error {
 	}
 
 	err := d.doDDLJob(ctx, job)
-	//err = d.callHookOnChanged(err)
 	return errors.Trace(err)
 }

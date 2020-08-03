@@ -19,7 +19,7 @@ import (
 	tspb "github.com/zhihu/zetta-proto/pkg/tablestore"
 )
 
-var (
+const (
 	AttrKeyMode   = "mode"
 	AttrKeyLayout = "layout"
 
@@ -110,6 +110,15 @@ func (tm *TableMeta) transferColumnFamilies() {
 		cfs = append(cfs, ncf)
 	}
 	tm.ColumnFamilies = cfs
+}
+
+func (tm *TableMeta) FindColumnByName(name string) *ColumnMeta {
+	for _, col := range tm.Columns {
+		if col.ColumnMeta.Name == name {
+			return col
+		}
+	}
+	return nil
 }
 
 func (tm *TableMeta) FindIndexByName(name string) *IndexMeta {
