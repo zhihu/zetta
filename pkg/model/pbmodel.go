@@ -36,7 +36,7 @@ type TableMeta struct {
 	// These changing schema operations don't include 'truncate table' and 'rename table'.
 	UpdateTS          uint64              `json:"update_timestamp"`
 	MaxColumnID       int64               `json:"max_col_id"`
-	MaxColumnFamilyID int64               `json:"max_cf_id`
+	MaxColumnFamilyID int64               `json:"max_cf_id"`
 	MaxIndexID        int64               `json:"max_idx_id"`
 	Columns           []*ColumnMeta       `json:"columns"`
 	ColumnFamilies    []*ColumnFamilyMeta `json:"columnfamilies"`
