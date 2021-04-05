@@ -37,7 +37,7 @@ func (r *keyRange) String() string {
 	} else {
 		sb.WriteString("(")
 	}
-	fmt.Fprintf(&sb, "%v,%v", r.startKey, r.endKey)
+	fmt.Fprintf(&sb, "%v,%v", r.start, r.end)
 	if r.endClosed {
 		sb.WriteString("]")
 	} else {
@@ -72,6 +72,7 @@ func makeKeyRange(r *tspb.KeyRange) *keyRange {
 	case *tspb.KeyRange_EndOpen:
 		kr.end = e.EndOpen
 	}
+
 	return &kr
 }
 

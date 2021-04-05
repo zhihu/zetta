@@ -34,6 +34,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/zhihu/zetta/tablestore/config"
+	"github.com/zhihu/zetta/tablestore/server/hthrift"
 	"github.com/zhihu/zetta/tablestore/session"
 )
 
@@ -69,6 +70,7 @@ type Server struct {
 	socket       net.Listener
 	rwlock       sync.RWMutex
 	rpcServer    *RPCServer
+	tServer      *hthrift.TServer
 	statusServer *http.Server
 
 	queryCtxs map[string]QueryCtx
@@ -98,6 +100,15 @@ func NewServer(cfg *config.Config, driver IDriver) (*Server, error) {
 	}
 	s.rpcServer = NewRPCServer(s)
 
+	if s.cfg.HBase.ThriftEnable {
+		zDriver := driver.(*ZettaDriver)
+		tServer, err := hthrift.NewTServer(s.cfg, session.CreateSessionFunc(zDriver.Store))
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		s.tServer = tServer
+	}
+
 	// Init rand seed for randomBuf()
 	rand.Seed(time.Now().UTC().UnixNano())
 	return s, nil
@@ -107,6 +118,9 @@ func NewServer(cfg *config.Config, driver IDriver) (*Server, error) {
 func (s *Server) Run() error {
 	if s.cfg.Status.ReportStatus {
 		s.startStatusHTTP()
+	}
+	if s.tServer != nil {
+		s.tServer.Run()
 	}
 	s.rpcServer.Run()
 	ticker := time.NewTicker(60 * time.Second)
@@ -127,7 +141,7 @@ func (s *Server) Run() error {
 func (s *Server) Close() {
 	s.rwlock.Lock()
 	defer s.rwlock.Unlock()
-
+	close(s.quitCh)
 	if s.rpcServer != nil {
 		s.rpcServer.Close()
 	}
@@ -136,6 +150,11 @@ func (s *Server) Close() {
 		terror.Log(errors.Trace(err))
 		s.statusServer = nil
 	}
+	if s.tServer != nil {
+		s.tServer.Close()
+		s.tServer = nil
+	}
+
 }
 
 func (s *Server) Chore() {
@@ -144,7 +163,7 @@ func (s *Server) Chore() {
 	curTime := time.Now()
 	for sessName, qctx := range s.queryCtxs {
 		session := qctx.GetSession()
-		if curTime.Sub(session.LastActive()) > 10*time.Minute {
+		if curTime.Sub(session.LastActive()) > 13*time.Minute {
 			delete(s.queryCtxs, sessName)
 			logutil.Logger(context.Background()).Info("collect session",
 				zap.String("session", session.GetName()), zap.Time("lastActive", session.LastActive()))
@@ -152,4 +171,8 @@ func (s *Server) Chore() {
 		}
 
 	}
+}
+
+func (s *Server) Config() *config.Config {
+	return s.cfg
 }

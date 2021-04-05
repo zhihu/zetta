@@ -20,6 +20,7 @@ import (
 type MutationRequest interface {
 	GetSession() string
 	GetMutations() []*tspb.Mutation
+	GetTable() string
 }
 
 type ReadRequest interface {

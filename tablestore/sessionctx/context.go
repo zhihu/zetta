@@ -36,7 +36,6 @@ import (
 
 // Context is an interface for transaction and executive args environment.
 type Context interface {
-	CreateTxn(context.Context, bool, bool) (kv.Transaction, error)
 	// NewTxn creates a new transaction for further execution.
 	// If old transaction is valid, it is committed first.
 	// It's used in BEGIN statement and DDL statements to commit old transaction.
@@ -118,23 +117,29 @@ const (
 	LastExecuteDDL basicCtxType = 3
 )
 
+type connIDCtxKeyType struct{}
+
 // ConnID is the key in context.
-const ConnID kv.ContextKey = "conn ID"
+var ConnID = connIDCtxKeyType{}
 
 // SetCommitCtx sets the variables for context before commit a transaction.
 func SetCommitCtx(ctx context.Context, sessCtx Context) context.Context {
 	return context.WithValue(ctx, ConnID, sessCtx.GetSessionVars().ConnectionID)
 }
 
+type txnIDCtxKeyType struct{}
+
 // TxnIDKey is the key in context
-const TxnIDKey kv.ContextKey = "transaction key"
+var TxnIDKey = txnIDCtxKeyType{}
 
 // SetTxnCtx sets the variables for context
 func SetTxnCtx(ctx context.Context, txn kv.Transaction) context.Context {
 	return context.WithValue(ctx, TxnIDKey, txn)
 }
 
-const StreamReadKey kv.ContextKey = "streamread key"
+type streamReadKeyType struct{}
+
+var StreamReadKey = streamReadKeyType{}
 
 func SetStreamReadKey(ctx context.Context) context.Context {
 	return context.WithValue(ctx, StreamReadKey, true)

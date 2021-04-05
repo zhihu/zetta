@@ -17,11 +17,16 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
+	parser_model "github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
+	"github.com/zhihu/zetta/pkg/codec"
 	"github.com/zhihu/zetta/pkg/model"
 	"github.com/zhihu/zetta/pkg/tablecodec"
+	"github.com/zhihu/zetta/tablestore/table"
 )
 
 type IndexInfo struct {
@@ -57,7 +62,7 @@ func (ii *IndexInfo) FromTableMeta(tbl *model.TableMeta, colIndex map[string]int
 	for _, col := range ii.cols {
 		colMeta := tbl.Columns[colIndex[col]]
 		ii.keys = append(ii.keys, colMeta)
-		ii.fieldTypes = append(ii.fieldTypes, colMeta.FieldType)
+		ii.fieldTypes = append(ii.fieldTypes, &colMeta.FieldType)
 	}
 	ii.IndexPrefix = tablecodec.EncodeTableIndexPrefix(tbl.Id, ii.ID)
 }
@@ -117,10 +122,112 @@ func (ii *IndexInfo) getColumnTypeMap(tbMeta *model.TableMeta) map[int64]*types.
 	var res = make(map[int64]*types.FieldType)
 	for _, c := range tbMeta.Columns {
 		for _, ic := range ii.cols {
-			if ic == c.Name {
-				res[c.Id] = c.FieldType
+			if ic == c.ColumnMeta.Name {
+				res[c.Id] = &c.FieldType
 			}
 		}
 	}
 	return res
+}
+
+/*------- Below is the zetta implementation of Index interface in tidb ---------*/
+
+// zettaIndex is the datastructure for index data of zetta in the KV store.
+type zettaIndex struct {
+	idxInfo                *parser_model.IndexInfo
+	tblInfo                *parser_model.TableInfo
+	prefix                 kv.Key
+	containNonBinaryString bool
+}
+
+func NewZettaIndex(physicalID int64, tblInfo *parser_model.TableInfo, indexInfo *parser_model.IndexInfo) table.Index {
+	index := &zettaIndex{
+		idxInfo: indexInfo,
+		tblInfo: tblInfo,
+		prefix:  tablecodec.EncodeTableIndexPrefix(physicalID, indexInfo.ID),
+	}
+	index.containNonBinaryString = index.checkContainNonBinaryString()
+	return index
+}
+
+/*------- helper functions -------*/
+
+func (c *zettaIndex) checkContainNonBinaryString() bool {
+	for _, idxCol := range c.idxInfo.Columns {
+		col := c.tblInfo.Columns[idxCol.Offset]
+		if col.EvalType() == types.ETString && !mysql.HasBinaryFlag(col.Flag) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *zettaIndex) getIndexKeyBuf(buf []byte, defaultCap int) []byte {
+	if buf != nil {
+		return buf[:0]
+	}
+
+	return make([]byte, 0, defaultCap)
+}
+
+/*------- interface implementation -------*/
+
+func (c *zettaIndex) Meta() *parser_model.IndexInfo {
+	return c.idxInfo
+}
+
+// GenIndexKey generates storage key for index values. Returned distinct indicates whether the
+// indexed values should be distinct in storage (i.e. whether handle is encoded in the key).
+func (c *zettaIndex) GenIndexKey(sc *stmtctx.StatementContext, indexedValues []types.Datum,
+	h table.Handle, buf []byte) (key []byte, distinct bool, err error) {
+	key = c.getIndexKeyBuf(buf, len(c.prefix)+len(indexedValues)*9+9)
+	key = append(key, []byte(c.prefix)...)
+	key, err = codec.EncodeKey(sc, key, indexedValues...)
+	if err != nil {
+		return nil, false, err
+	}
+	if !distinct && h != nil {
+		if h.IsInt() {
+			key, err = codec.EncodeKey(sc, key, types.NewDatum(h.IntValue()))
+		} else {
+			key = append(key, h.Encoded()...)
+		}
+	}
+	return
+}
+
+func (c *zettaIndex) Create(ctx sessionctx.Context, rm kv.RetrieverMutator, indexedValues []types.Datum,
+	h table.Handle, opts ...table.CreateIdxOptFunc) (table.Handle, error) {
+	return nil, nil
+}
+
+func (c *zettaIndex) Delete(sc *stmtctx.StatementContext, m kv.Mutator, indexedValues []types.Datum, h table.Handle) error {
+	return nil
+}
+
+func (c *zettaIndex) Drop(rm kv.RetrieverMutator) error {
+	return nil
+}
+
+// Exist supports check index exists or not.
+func (c *zettaIndex) Exist(sc *stmtctx.StatementContext, rm kv.RetrieverMutator,
+	indexedValues []types.Datum, h table.Handle) (bool, table.Handle, error) {
+	return false, nil, nil
+}
+
+// Seek supports where clause.
+func (c *zettaIndex) Seek(sc *stmtctx.StatementContext, r kv.Retriever, indexedValues []types.Datum) (iter table.IndexIterator, hit bool, err error) {
+	return nil, false, nil
+}
+
+// SeekFirst supports aggregate min and ascend order by.
+func (c *zettaIndex) SeekFirst(r kv.Retriever) (iter table.IndexIterator, err error) {
+	return nil, nil
+}
+
+// FetchValues fetched index column values in a row.
+// Param columns is a reused buffer, if it is not nil, FetchValues will fill the index values in it,
+// and return the buffer, if it is nil, FetchValues will allocate the buffer instead.
+func (c *zettaIndex) FetchValues(row []types.Datum, columns []types.Datum) ([]types.Datum, error) {
+	return nil, nil
 }

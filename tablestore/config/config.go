@@ -16,9 +16,11 @@ package config
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -38,6 +40,15 @@ const (
 	DefTxnEntryCountLimit = 300 * 1000
 	// DefTxnTotalSizeLimit is the default value of TxnTxnTotalSizeLimit.
 	DefTxnTotalSizeLimit = 100 * 1024 * 1024
+
+	// DefPort is the default port of TiDB
+	DefPort = 4000
+	// DefStatusPort is the default status port of TiDB
+	DefStatusPort = 10080
+	// DefHost is the default host of TiDB
+	DefHost = "0.0.0.0"
+	// DefStatusHost is the default status host of TiDB
+	DefStatusHost = "0.0.0.0"
 )
 
 // Valid config maps
@@ -50,23 +61,41 @@ var (
 	CheckTableBeforeDrop = false
 	// checkBeforeDropLDFlag is a go build flag.
 	checkBeforeDropLDFlag = "None"
+	// tempStorageDirName is the default temporary storage dir name by base64 encoding a string `port/statusPort`
+	tempStorageDirName = encodeDefTempStorageDir(DefHost, DefStatusHost, DefPort, DefStatusPort)
 )
+
+func encodeDefTempStorageDir(host, statusHost string, port, statusPort uint) string {
+	dirName := base64.URLEncoding.EncodeToString([]byte(fmt.Sprintf("%v:%v/%v:%v", host, port, statusHost, statusPort)))
+	var osUID string
+	currentUser, err := user.Current()
+	if err != nil {
+		osUID = ""
+	} else {
+		osUID = currentUser.Uid
+	}
+	return filepath.Join(os.TempDir(), osUID+"_tidb", dirName, "tmp-storage")
+}
 
 type Config struct {
 	Host             string `toml:"host" json:"host"`
 	AdvertiseAddress string `toml:"advertise-address" json:"advertise-address"`
 	Port             uint   `toml:"port" json:"port"`
+	SQLPort          uint   `toml:"port" json:"sqlport"`
 	Cors             string `toml:"cors" json:"cors"`
 	Store            string `toml:"store" json:"store"`
 	Path             string `toml:"path" json:"path"`
 	Socket           string `toml:"socket" json:"socket"`
 
-	MaxSessions int         `toml:"max-sessions" json:"max-sessions"`
-	Security    Security    `toml:"security" json:"security"`
-	Log         Log         `toml:"log" json:"log"`
-	Status      Status      `toml:"status" json:"status"`
-	OpenTracing OpenTracing `toml:"opentracing" json:"opentracing"`
-	TiKVClient  TiKVClient  `toml:"tikv-client" json:"tikv-client"`
+	MaxSessions     int         `toml:"max-sessions" json:"max-sessions"`
+	Security        Security    `toml:"security" json:"security"`
+	Log             Log         `toml:"log" json:"log"`
+	Lease           string      `toml:"lease" json:"lease"`
+	HBase           HBaseConfig `toml:"hbase-config" json:"hbase-config"`
+	Status          Status      `toml:"status" json:"status"`
+	OpenTracing     OpenTracing `toml:"opentracing" json:"opentracing"`
+	TiKVClient      TiKVClient  `toml:"tikv-client" json:"tikv-client"`
+	TempStoragePath string      `toml:"tmp-storage-path" json:"tmp-storage-path"`
 }
 
 type Log struct {
@@ -143,6 +172,14 @@ func (s *Security) ToTLSConfig() (*tls.Config, error) {
 	}
 
 	return tlsConfig, nil
+}
+
+type HBaseConfig struct {
+	ThriftEnable    bool   `toml:"thrift-enable" json:"thrift-enable"`
+	ThriftHost      string `toml:"thrift-host" json:"thrift-host"`
+	ThriftPort      int32  `toml:"thrift-port" json:"thrift-port"`
+	ThriftProtocol  string `toml:"thrift-protocol" json:"thrift-protocol"`
+	ThriftTransport string `toml:"thrift-transport" json:"thrift-transport"`
 }
 
 // Status is the status section of the config.
@@ -244,20 +281,31 @@ var defaultConf = Config{
 	Host:             "0.0.0.0",
 	AdvertiseAddress: "",
 	Port:             4000,
+	SQLPort:          4001,
 	Store:            "mocktikv",
 	Path:             "/tmp/",
+	Lease:            "45s",
 
 	MaxSessions: 10000,
 	Log: Log{
 		Level:               "info",
 		Format:              "text",
-		File:                logutil.NewFileLogConfig(true, logutil.DefaultLogMaxSize),
+		File:                logutil.NewFileLogConfig(logutil.DefaultLogMaxSize),
 		SlowQueryFile:       "tidb-slow.log",
 		SlowThreshold:       logutil.DefaultSlowThreshold,
 		ExpensiveThreshold:  10000,
 		QueryLogMaxLen:      logutil.DefaultQueryLogMaxLen,
 		RecordPlanInSlowLog: logutil.DefaultRecordPlanInSlowLog,
 	},
+
+	HBase: HBaseConfig{
+		ThriftEnable:    true,
+		ThriftHost:      "0.0.0.0",
+		ThriftPort:      9090,
+		ThriftProtocol:  "binary",
+		ThriftTransport: "buffered",
+	},
+
 	Status: Status{
 		ReportStatus:    true,
 		StatusHost:      "0.0.0.0",
@@ -289,6 +337,7 @@ var defaultConf = Config{
 		RegionCacheTTL: 600,
 		StoreLimit:     0,
 	},
+	TempStoragePath: tempStorageDirName,
 }
 
 var (

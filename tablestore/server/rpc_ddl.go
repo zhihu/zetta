@@ -45,7 +45,7 @@ func (rs *RPCServer) CreateTable(ctx context.Context, req *tspb.CreateTableReque
 	do := domain.GetOnlyDomain()
 	tbMeta := model.NewTableMetaFromPbReq(req)
 	sctx := mock.NewContext() // Use mock to provide a default session context.
-	err := do.DDL().CreateTable(sctx, tbMeta)
+	err := do.DDL().CreateTable(sctx, tbMeta, false)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, err.Error())
 	}
@@ -55,7 +55,11 @@ func (rs *RPCServer) CreateTable(ctx context.Context, req *tspb.CreateTableReque
 func (rs *RPCServer) AddColumn(ctx context.Context, req *tspb.AddColumnRequest) (*tspb.AddColumnResponse, error) {
 	do := domain.GetOnlyDomain()
 	sctx := mock.NewContext()
-	err := do.DDL().AddColumn(sctx, req)
+	colMetas := make([]*model.ColumnMeta, len(req.Columns))
+	for i := range colMetas {
+		colMetas[i] = model.NewColumnMetaFromPb(req.Columns[i])
+	}
+	err := do.DDL().AddColumn(sctx, req.Database, req.Table, colMetas)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, err.Error())
 	}
@@ -89,7 +93,7 @@ func (rs *RPCServer) ListTables(ctx context.Context,
 func (rs *RPCServer) DropTable(ctx context.Context, req *tspb.DropTableRequest) (*tspb.DropTableResponse, error) {
 	do := domain.GetOnlyDomain()
 	sctx := mock.NewContext()
-	err := do.DDL().DropTable(sctx, req.Database, req.Table)
+	err := do.DDL().DropTable(sctx, req.Database, req.Table, false)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, err.Error())
 	}
@@ -106,7 +110,7 @@ func (rs *RPCServer) CreateIndex(ctx context.Context, req *tspb.CreateIndexReque
 	do := domain.GetOnlyDomain()
 	indexMeta := model.NewIndexMetaFromPbReq(req)
 	sctx := mock.NewContext()
-	err := do.DDL().CreateIndex(sctx, req.Database, req.Table, indexMeta)
+	err := do.DDL().CreateIndex(sctx, req.Database, req.Table, indexMeta, true)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, err.Error())
 	}

@@ -70,10 +70,7 @@ func datumFromTypeValue(pt *tspb.Type, v *tspb.Value) (types.Datum, error) {
 			logutil.Logger(context.Background()).Error("decode value err", zap.Error(err))
 			return rd, err
 		}
-		val := types.Time{
-			Time: types.FromGoTime(ts),
-			Type: mysql.TypeTimestamp,
-		}
+		val := types.NewTime(types.FromGoTime(ts), mysql.TypeTimestamp, types.DefaultFsp)
 		rd = types.NewTimeDatum(val)
 
 	case tspb.TypeCode_DATE:
@@ -82,10 +79,8 @@ func datumFromTypeValue(pt *tspb.Type, v *tspb.Value) (types.Datum, error) {
 			logutil.Logger(context.Background()).Error("decode value err", zap.Error(err))
 			return rd, err
 		}
-		tt := types.Time{
-			Time: types.FromDate(date.Year, int(date.Month), date.Day, 0, 0, 0, 0),
-			Type: mysql.TypeDate,
-		}
+		coreTime := types.FromDate(date.Year, int(date.Month), date.Day, 0, 0, 0, 0)
+		tt := types.NewTime(coreTime, mysql.TypeDate, types.DefaultFsp)
 		rd = types.NewTimeDatum(tt)
 
 	case tspb.TypeCode_STRING:
@@ -121,16 +116,16 @@ func protoValueFromDatum(d types.Datum, pt *tspb.Type) (*tspb.Value, error) {
 		x := (d.GetInt64() > 0)
 		return rpc.BoolProto(x), nil
 	case tspb.TypeCode_INT64:
-		s := strconv.FormatInt(d.GetInt64(), 10)
-		return rpc.StringProto(s), nil
+		s := d.GetInt64()
+		return rpc.IntProto(s), nil
 	case tspb.TypeCode_FLOAT64:
 		x := d.GetFloat64()
 		return rpc.FloatProto(x), nil
 	case tspb.TypeCode_TIMESTAMP:
 		x := d.GetMysqlTime()
-		switch x.Type {
+		switch x.Type() {
 		case mysql.TypeTimestamp:
-			tt, err := x.Time.GoTime(time.Local)
+			tt, err := x.GoTime(time.Local)
 			if err != nil {
 				return nil, status.Errorf(codes.FailedPrecondition, "datum wasn't correctly encoded: <%v>", err)
 			}
@@ -140,9 +135,9 @@ func protoValueFromDatum(d types.Datum, pt *tspb.Type) (*tspb.Value, error) {
 
 	case tspb.TypeCode_DATE:
 		x := d.GetMysqlTime()
-		switch x.Type {
+		switch x.Type() {
 		case mysql.TypeDate, mysql.TypeDatetime:
-			tt, err := x.Time.GoTime(time.Local)
+			tt, err := x.GoTime(time.Local)
 			if err != nil {
 				return nil, status.Errorf(codes.FailedPrecondition, "datum wasn't correctly encoded: <%v>", err)
 			}
@@ -263,7 +258,7 @@ func protoType2FieldType(pt *tspb.Type) *types.FieldType {
 	case tspb.TypeCode_STRING:
 		return types.NewFieldType(mysql.TypeVarchar)
 	case tspb.TypeCode_BYTES:
-		return types.NewFieldType(mysql.TypeBit)
+		return types.NewFieldType(mysql.TypeBlob)
 	case tspb.TypeCode_STRUCT:
 		return types.NewFieldType(mysql.TypeJSON)
 	default:

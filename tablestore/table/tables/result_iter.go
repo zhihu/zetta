@@ -22,18 +22,25 @@ import (
 	"github.com/zhihu/zetta/tablestore/table"
 )
 
-var ()
-
 type resultIter struct {
 	columns   []*tspb.ColumnMeta
 	rowChan   chan *tspb.SliceCell
 	rowsCount int64
+	nextToken []byte
 	limit     int64
 	lastErr   error
+	quitCh    chan struct{}
+}
+
+func NewResultIter(limit int64) *resultIter {
+	return &resultIter{
+		rowChan: make(chan *tspb.SliceCell, 32),
+		limit:   limit,
+		quitCh:  make(chan struct{}),
+	}
 }
 
 func (ri *resultIter) Columns() []*tspb.ColumnMeta {
-
 	return ri.columns
 }
 
@@ -49,17 +56,36 @@ func (ri *resultIter) Next(ctx context.Context) (interface{}, error) {
 	return row, nil
 }
 
+func (ri *resultIter) NextToken() []byte {
+	return ri.nextToken
+}
+
 func (ri *resultIter) Close() error {
-	close(ri.rowChan)
+	select {
+	case <-ri.quitCh:
+		return ri.lastErr
+	default:
+		close(ri.quitCh)
+		close(ri.rowChan)
+	}
 	return ri.lastErr
 }
 
 func (ri *resultIter) sendData(row *tspb.SliceCell) error {
+	defer func() {
+		if x := recover(); x != nil {
+			return
+		}
+	}()
 	if ri.limit > 0 && atomic.LoadInt64(&ri.rowsCount) > ri.limit {
-		return table.ErrUserLimitReached
+		return table.ErrResultSetUserLimitReached
 	}
-	ri.rowChan <- row
-	atomic.AddInt64(&ri.rowsCount, 1)
+	select {
+	case <-ri.quitCh:
+	case ri.rowChan <- row:
+		atomic.AddInt64(&ri.rowsCount, 1)
+	}
+
 	return nil
 }
 

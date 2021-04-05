@@ -35,14 +35,25 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/store/tikv/oracle"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/util/logutil"
+	"github.com/zhihu/zetta/tablestore/config"
 	"go.uber.org/zap"
 )
+
+var (
+	_ kv.Transaction = (*TxnState)(nil)
+)
+
+// TxnStateOption Zetta TxnState Option
+type TxnStateOption struct {
+	ReadOnly bool
+	Single   bool
+	isRawKV  bool
+}
 
 // TxnState wraps kv.Transaction to provide a new kv.Transaction.
 // 1. It holds all statement related modification in the buffer before flush to the txn,
@@ -58,10 +69,9 @@ type TxnState struct {
 	kv.Transaction
 	txnFuture *txnFuture
 
-	buf kv.MemBuffer
+	stmtBuf kv.MemBuffer
 
-	ReadOnly    bool
-	Single      bool
+	TxnOpt      TxnStateOption
 	doNotCommit error
 	mu          sync.Mutex
 	inProgress  atomic.Value
@@ -70,7 +80,42 @@ type TxnState struct {
 }
 
 func (st *TxnState) init() {
-	st.buf = kv.NewMemDbBuffer(kv.DefaultTxnMembufCap)
+}
+
+func (st *TxnState) initStmtBuf() {
+	if st.stmtBuf == nil {
+		st.stmtBuf = st.Transaction.NewStagingBuffer()
+	}
+}
+
+func (st *TxnState) stmtBufLen() int {
+	if st.stmtBuf == nil {
+		return 0
+	}
+	return st.stmtBuf.Len()
+}
+
+func (st *TxnState) stmtBufSize() int {
+	if st.stmtBuf == nil {
+		return 0
+	}
+	return st.stmtBuf.Size()
+}
+
+func (st *TxnState) stmtBufGet(ctx context.Context, k kv.Key) ([]byte, error) {
+	if st.stmtBuf == nil {
+		return nil, kv.ErrNotExist
+	}
+	return st.stmtBuf.Get(ctx, k)
+}
+
+// Size implements the MemBuffer interface.
+func (st *TxnState) Size() int {
+	size := st.stmtBufSize()
+	if st.Transaction != nil {
+		size += st.Transaction.Size()
+	}
+	return size
 }
 
 // Valid implements the kv.Transaction interface.
@@ -111,8 +156,8 @@ func (st *TxnState) GoString() string {
 		// if len(st.mutations) > 0 {
 		// 	fmt.Fprintf(&s, ", len(mutations)=%d, %#v", len(st.mutations), st.mutations)
 		// }
-		if st.buf != nil && st.buf.Len() != 0 {
-			fmt.Fprintf(&s, ", buf.length: %d, buf.size: %d", st.buf.Len(), st.buf.Size())
+		if st.stmtBuf.Len() != 0 {
+			fmt.Fprintf(&s, ", buf.length: %d, buf.size: %d", st.stmtBufLen(), st.stmtBufSize())
 		}
 	} else {
 		s.WriteString("state=invalid")
@@ -132,20 +177,17 @@ func (st *TxnState) changeInvalidToPending(future *txnFuture) {
 	st.txnFuture = future
 }
 
-func (st *TxnState) changePendingToValid(txnCap int) error {
+func (st *TxnState) changePendingToValid() error {
 	if st.txnFuture == nil {
 		return errors.New("transaction future is not set")
 	}
-
 	future := st.txnFuture
 	st.txnFuture = nil
-
 	txn, err := future.wait()
 	if err != nil {
 		st.Transaction = nil
 		return err
 	}
-	txn.SetCap(txnCap)
 	st.Transaction = txn
 	return nil
 }
@@ -157,23 +199,33 @@ func (st *TxnState) changeToInvalid() {
 
 // Commit overrides the Transaction interface.
 func (st *TxnState) Commit(ctx context.Context) error {
+	defer st.reset()
 	if st.doNotCommit != nil {
 		if err1 := st.Transaction.Rollback(); err1 != nil {
 			logutil.Logger(context.Background()).Error("rollback error", zap.Error(err1))
 		}
 		return errors.Trace(st.doNotCommit)
 	}
-
-	err := st.Transaction.Commit(ctx)
-	if err == nil {
-		st.reset()
+	if err := st.Transaction.Commit(ctx); err != nil {
+		logutil.BgLogger().Error("commit error", zap.Error(err))
+		return err
 	}
-	return err
+	return nil
+
+}
+
+// Flush flushes all staging kvs into parent buffer.
+func (st *TxnState) Flush() (int, error) {
+	if st.stmtBuf == nil {
+		return 0, nil
+	}
+	return st.stmtBuf.Flush()
 }
 
 // Rollback overrides the Transaction interface.
 func (st *TxnState) Rollback() error {
 	defer st.reset()
+	logutil.BgLogger().Info(fmt.Sprintf("transaction %v, st: %+v", st.Transaction, st))
 	return st.Transaction.Rollback()
 }
 
@@ -184,10 +236,10 @@ func (st *TxnState) reset() {
 }
 
 // Get overrides the Transaction interface.
-func (st *TxnState) Get(k kv.Key) ([]byte, error) {
-	val, err := st.buf.Get(k)
+func (st *TxnState) Get(ctx context.Context, k kv.Key) ([]byte, error) {
+	val, err := st.stmtBufGet(ctx, k)
 	if kv.IsErrNotFound(err) {
-		val, err = st.Transaction.Get(k)
+		val, err = st.Transaction.Get(ctx, k)
 		if kv.IsErrNotFound(err) {
 			return nil, err
 		}
@@ -201,12 +253,20 @@ func (st *TxnState) Get(k kv.Key) ([]byte, error) {
 	return val, nil
 }
 
+// GetMemBuffer overrides the Transaction interface.
+func (st *TxnState) GetMemBuffer() kv.MemBuffer {
+	if st.stmtBuf == nil || st.stmtBuf.Size() == 0 {
+		return st.Transaction.GetMemBuffer()
+	}
+	return kv.NewBufferStoreFrom(st.Transaction.GetMemBuffer(), st.stmtBuf)
+}
+
 // BatchGet overrides the Transaction interface.
-func (st *TxnState) BatchGet(keys []kv.Key) (map[string][]byte, error) {
+func (st *TxnState) BatchGet(ctx context.Context, keys []kv.Key) (map[string][]byte, error) {
 	bufferValues := make([][]byte, len(keys))
 	shrinkKeys := make([]kv.Key, 0, len(keys))
 	for i, key := range keys {
-		val, err := st.buf.Get(key)
+		val, err := st.stmtBufGet(ctx, key)
 		if kv.IsErrNotFound(err) {
 			shrinkKeys = append(shrinkKeys, key)
 			continue
@@ -218,7 +278,7 @@ func (st *TxnState) BatchGet(keys []kv.Key) (map[string][]byte, error) {
 			bufferValues[i] = val
 		}
 	}
-	storageValues, err := st.Transaction.BatchGet(shrinkKeys)
+	storageValues, err := st.Transaction.BatchGet(ctx, shrinkKeys)
 	if err != nil {
 		return nil, err
 	}
@@ -233,34 +293,43 @@ func (st *TxnState) BatchGet(keys []kv.Key) (map[string][]byte, error) {
 
 // Set overrides the Transaction interface.
 func (st *TxnState) Set(k kv.Key, v []byte) error {
-	return st.buf.Set(k, v)
+	st.initStmtBuf()
+	return st.stmtBuf.Set(k, v)
 }
 
 // Delete overrides the Transaction interface.
 func (st *TxnState) Delete(k kv.Key) error {
-	return st.buf.Delete(k)
+	st.initStmtBuf()
+	return st.stmtBuf.Delete(k)
 }
 
 // Iter overrides the Transaction interface.
 func (st *TxnState) Iter(k kv.Key, upperBound kv.Key) (kv.Iterator, error) {
-	bufferIt, err := st.buf.Iter(k, upperBound)
-	if err != nil {
-		return nil, err
-	}
 	retrieverIt, err := st.Transaction.Iter(k, upperBound)
 	if err != nil {
 		return nil, err
 	}
+	if st.stmtBuf == nil {
+		return retrieverIt, nil
+	}
+	bufferIt, err := st.stmtBuf.Iter(k, upperBound)
+	if err != nil {
+		return nil, err
+	}
+
 	return kv.NewUnionIter(bufferIt, retrieverIt, false)
 }
 
 // IterReverse overrides the Transaction interface.
 func (st *TxnState) IterReverse(k kv.Key) (kv.Iterator, error) {
-	bufferIt, err := st.buf.IterReverse(k)
+	retrieverIt, err := st.Transaction.IterReverse(k)
 	if err != nil {
 		return nil, err
 	}
-	retrieverIt, err := st.Transaction.IterReverse(k)
+	if st.stmtBuf == nil {
+		return retrieverIt, nil
+	}
+	bufferIt, err := st.stmtBuf.IterReverse(k)
 	if err != nil {
 		return nil, err
 	}
@@ -268,13 +337,16 @@ func (st *TxnState) IterReverse(k kv.Key) (kv.Iterator, error) {
 }
 
 func (st *TxnState) cleanup() {
-	st.buf.Reset()
+	if st.stmtBuf != nil {
+		st.stmtBuf.Discard()
+		st.stmtBuf = nil
+	}
 }
 
 // KeysNeedToLock returns the keys need to be locked.
 func (st *TxnState) KeysNeedToLock() ([]kv.Key, error) {
-	keys := make([]kv.Key, 0, st.buf.Len())
-	if err := kv.WalkMemBuffer(st.buf, func(k kv.Key, v []byte) error {
+	keys := make([]kv.Key, 0, st.stmtBuf.Len())
+	if err := kv.WalkMemBuffer(st.stmtBuf, func(k kv.Key, v []byte) error {
 		if !keyNeedToLock(k, v) {
 			return nil
 		}
@@ -324,24 +396,23 @@ type txnFuture struct {
 }
 
 func (tf *txnFuture) wait() (kv.Transaction, error) {
-	if tf.mockFail {
-		return nil, errors.New("mock get timestamp fail")
-	}
-
 	startTS, err := tf.future.Wait()
 	if err == nil {
+		logutil.BgLogger().Debug("wait startTS", zap.Uint64("startTs", startTS))
 		return tf.store.BeginWithStartTS(startTS)
+	} else if config.GetGlobalConfig().Store == "mocktikv" {
+		return nil, err
 	}
-
+	logutil.BgLogger().Warn("wait tso failed", zap.Error(err))
 	// It would retry get timestamp.
 	return tf.store.Begin()
 }
 
 func (s *session) getTxnFuture(ctx context.Context) *txnFuture {
-	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
-		span1 := span.Tracer().StartSpan("session.getTxnFuture", opentracing.ChildOf(span.Context()))
-		defer span1.Finish()
-	}
+	// if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+	// 	span1 := span.Tracer().StartSpan("session.getTxnFuture", opentracing.ChildOf(span.Context()))
+	// 	defer span1.Finish()
+	// }
 
 	oracleStore := s.store.GetOracle()
 	var tsFuture oracle.Future
@@ -351,9 +422,6 @@ func (s *session) getTxnFuture(ctx context.Context) *txnFuture {
 		tsFuture = oracleStore.GetTimestampAsync(ctx)
 	}
 	ret := &txnFuture{future: tsFuture, store: s.store}
-	if x := ctx.Value("mockGetTSFail"); x != nil {
-		ret.mockFail = true
-	}
 	return ret
 }
 
@@ -363,11 +431,6 @@ func NewTxnState(sess *session) (*TxnState, error) {
 		session: sess,
 	}
 	txn.init()
-	transaction, err := sess.store.Begin()
-	if err != nil {
-		return nil, err
-	}
-	txn.Transaction = transaction
 	return txn, nil
 }
 

@@ -29,6 +29,7 @@ import (
 	tspb "github.com/zhihu/zetta-proto/pkg/tablestore"
 	"github.com/zhihu/zetta/pkg/model"
 	"github.com/zhihu/zetta/pkg/tablecodec"
+	"github.com/zhihu/zetta/tablestore/mysql/sctx"
 	"github.com/zhihu/zetta/tablestore/sessionctx"
 	"go.uber.org/zap"
 )
@@ -75,40 +76,50 @@ func (t *tableCommon) prepareDeleteCFOptions(ctx context.Context, family string,
 		cfmap    = make(map[string]*model.ColumnFamilyMeta)
 		cfColMap = make(map[string]map[string]int)
 	)
-	if family == "" {
-		family = DefaultColumnFamily
-	}
-	cf, ok := t.cfIDMap[family]
-	if !ok {
-		return nil, status.Errorf(codes.FailedPrecondition, "cf %s not in table %s", family, t.meta.TableName)
-	}
-	cfmap[family] = cf
-	cfColMap[family] = make(map[string]int)
 
 	delOpts := &deleteOptions{
 		pkfts:    t.buildPrimaryKeyFieldTypes(),
 		cfmap:    cfmap,
 		cfColMap: cfColMap,
 	}
+	if family == "" && len(columns) == 0 {
 
-	if len(columns) == 0 {
 		delOpts.RowDelete = true
-		return delOpts, nil
+		for _, cf := range t.CFs {
+			cfmap[cf.Name] = cf
+		}
+
+	} else if family == "" && len(columns) != 0 {
+
+		family = DefaultColumnFamily
+		cfmap[family] = t.cfIDMap[family]
+		cfColMap[family] = make(map[string]int)
+
+	} else if family != "" {
+		cf, ok := t.cfIDMap[family]
+		if !ok {
+			return nil, status.Errorf(codes.FailedPrecondition, "cf %s not in table %s", family, t.meta.TableName)
+		}
+		cfmap[family] = cf
+		cfColMap[family] = make(map[string]int)
+		if len(columns) == 0 {
+			delOpts.RowDelete = true
+		}
+		if isFlexible(cf) {
+			for _, col := range columns {
+				colEntry := &columnEntry{
+					name: col,
+					t:    &tspb.Type{Code: tspb.TypeCode_TYPE_CODE_UNSPECIFIED},
+					ft:   nil,
+					cfID: cf.Id,
+					cf:   cf.Name,
+				}
+				fields = append(fields, colEntry)
+			}
+		}
+		delOpts.fields = fields
 	}
 
-	if isFlexible(cf) {
-		for _, col := range columns {
-			colEntry := &columnEntry{
-				name: col,
-				t:    &tspb.Type{Code: tspb.TypeCode_TYPE_CODE_UNSPECIFIED},
-				ft:   nil,
-				cfID: cf.Id,
-				cf:   cf.Name,
-			}
-			fields = append(fields, colEntry)
-		}
-	}
-	delOpts.fields = fields
 	return delOpts, nil
 }
 
@@ -273,7 +284,7 @@ func (t *tableCommon) removeRowCompact(ctx context.Context, cf *model.ColumnFami
 	}
 	pkfts := t.buildPrimaryKeyFieldTypes()
 	_, pKeys, _, _, err := tablecodec.DecodeRecordKey(recordKey, pkfts, time.Local)
-	valBody, err := txn.Get(recordKey)
+	valBody, err := txn.Get(ctx, recordKey)
 	if err != nil {
 		logutil.Logger(ctx).Error("get record key value error", zap.Error(err))
 		return err
@@ -370,7 +381,7 @@ func (t *tableCommon) getColumnInfo(column string, cf *model.ColumnFamilyMeta) (
 	}
 	if colIdx, ok := t.colIndex[column]; ok {
 		colMeta := t.Columns[colIdx]
-		return colMeta.Id, colMeta.FieldType, nil
+		return colMeta.Id, &colMeta.FieldType, nil
 	}
 	return -1, nil, status.Errorf(codes.NotFound, "no such column %s ", column)
 }
@@ -384,7 +395,7 @@ func (t *tableCommon) removeRecordWithIndex(ctx context.Context, pKeys []types.D
 			logutil.Logger(ctx).Error("build record-key Compact error", zap.Error(err))
 			return err
 		}
-		valBody, err := txn.Get(recordKey)
+		valBody, err := txn.Get(ctx, recordKey)
 		if err != nil {
 			logutil.Logger(ctx).Error("get record-key val error", zap.Error(err))
 			return err
@@ -502,6 +513,9 @@ func (t *tableCommon) removeFlexibleSparseColumn(ctx context.Context, pkeys []ty
 		sc  = &stmtctx.StatementContext{TimeZone: time.Local}
 	)
 	for _, cf := range delOpts.cfmap {
+		if !isFlexible(cf) {
+			continue
+		}
 		for _, col := range delOpts.fields {
 			if col.cf == cf.Name {
 				recordKey, err := tablecodec.EncodeRecordKeyHigh(sc, t.tableID, pkeys, cf.Id, []byte(col.name))
@@ -624,6 +638,79 @@ func (t *tableCommon) deleteKeys(ctx context.Context, k, upperBound kv.Key) erro
 			return err
 		}
 		iter.Next()
+	}
+	return nil
+}
+
+/***************************************MySQL Delete***********************************************/
+
+func (t *tableCommon) getRowKey(row []types.Datum) (kv.Key, error) {
+	pkDatums := t.collectPrimaryKeyDatums(row)
+	rowKey, err := tablecodec.EncodeRecordKeyWide(nil, t.Meta().Id, pkDatums, 0)
+	return rowKey, err
+}
+
+func (t *tableCommon) buildSecondaryIndex(ctx sctx.Context, row []types.Datum) error {
+	return nil
+}
+
+func (t *tableCommon) deleteIndex(ctx sctx.Context, row []types.Datum, txn kv.Transaction) error {
+	pkDatums := t.collectPrimaryKeyDatums(row)
+	for _, idx := range t.Indices {
+		key, err := t.buildIndex(ctx, row, pkDatums, idx)
+		if err != nil {
+			return err
+		}
+		if err = txn.Delete(key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *tableCommon) UpdateRecord(ctx sctx.Context, row []types.Datum, vals map[int64]types.Datum) error {
+	rowKey, err := t.getRowKey(row)
+	if err != nil {
+		return err
+	}
+	txn, err := ctx.GetTxn(true, t.isRaw())
+	if err != nil {
+		return err
+	}
+	colIDs := t.collectColID()
+	for id, dt := range vals {
+		row[id-1] = dt
+	}
+	record, err := tablecodec.EncodeRow(nil, row, colIDs, nil, nil)
+	if err != nil {
+		return err
+	}
+	if err = txn.Set(rowKey, record); err != nil {
+		return err
+	}
+	if _, err = txn.Flush(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (t *tableCommon) RemoveRecord(ctx sctx.Context, row []types.Datum) error {
+	rowKey, err := t.getRowKey(row)
+	if err != nil {
+		return err
+	}
+	txn, err := ctx.GetTxn(true, t.isRaw())
+	if err != nil {
+		return err
+	}
+	if err = t.deleteIndex(ctx, row, txn); err != nil {
+		return err
+	}
+	if err = txn.Delete(rowKey); err != nil {
+		return err
+	}
+	if _, err = txn.Flush(); err != nil {
+		return err
 	}
 	return nil
 }

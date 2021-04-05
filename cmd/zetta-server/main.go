@@ -17,9 +17,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
-	"github.com/opentracing/opentracing-go"
+	"github.com/ngaut/pools"
+	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
 	"github.com/pingcap/parser/terror"
 	"github.com/prometheus/client_golang/prometheus"
@@ -31,23 +33,34 @@ import (
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/util/signal"
+
+	//"github.com/zhihu/zetta/pkg/store/mockstore"
+	//"github.com/zhihu/zetta/pkg/store/tikv"
 
 	kvstore "github.com/pingcap/tidb/store"
-	"github.com/zhihu/zetta/pkg/metrics"
 
+	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/zhihu/zetta/pkg/metrics"
+	ts "github.com/zhihu/zetta/tablestore"
 	"github.com/zhihu/zetta/tablestore/config"
+	"github.com/zhihu/zetta/tablestore/ddl/gcworker"
 	"github.com/zhihu/zetta/tablestore/domain"
+	mysvr "github.com/zhihu/zetta/tablestore/mysql/server"
 	"github.com/zhihu/zetta/tablestore/server"
+	"github.com/zhihu/zetta/tablestore/zstore"
 )
 
 const (
-	nmVersion   = "V"
-	nmPort      = "P"
-	nmLogLevel  = "L"
-	nmLogFile   = "log-file"
-	nmStore     = "store"
-	nmStorePath = "path"
-	nmHost      = "host"
+	nmVersion          = "V"
+	nmPort             = "P"
+	nmLogLevel         = "L"
+	nmLogFile          = "log-file"
+	nmStore            = "store"
+	nmStorePath        = "path"
+	nmHost             = "host"
+	nmAdvertiseAddress = "advertise-address"
+	nmProtocol         = "protocol"
 
 	nmReportStatus    = "report-status"
 	nmStatusHost      = "status-host"
@@ -55,14 +68,22 @@ const (
 	nmMetricsAddr     = "metrics-addr"
 	nmMetricsInterval = "metrics-interval"
 	nmListenPort      = "port"
+	nmListenSQLPort   = "sqlport"
+
+	nmThrift          = "enable-thrift"
+	nmThriftTransport = "thrift-transport"
+	nmThriftProtocol  = "thrift-protocol"
+	nmThriftPort      = "thrift-port"
 )
 
 var (
 	version = flagBoolean(nmVersion, false, "print version information and exit")
 	// Base
-	storePath = flag.String(nmStorePath, "/tmp/zetta", "tidb storage path")
-	store     = flag.String(nmStore, "mocktikv", "registered store name, [tikv, mocktikv]")
-	port      = flag.Uint(nmListenPort, 4000, "rpc server listening port")
+	storePath        = flag.String(nmStorePath, "/tmp/tidb", "tidb storage path")
+	store            = flag.String(nmStore, "mocktikv", "registered store name, [tikv, mocktikv]")
+	advertiseAddress = flag.String(nmAdvertiseAddress, "", "tidb server advertise IP")
+	port             = flag.Uint(nmListenPort, 4000, "rpc server listening port")
+	sqlPort          = flag.Uint(nmListenSQLPort, 4001, "sql server listening port")
 	// Log
 	logLevel = flag.String(nmLogLevel, "info", "log level: info, debug, warn, error, fatal")
 	logFile  = flag.String(nmLogFile, "", "log file path")
@@ -70,22 +91,30 @@ var (
 	// Status
 	reportStatus    = flagBoolean(nmReportStatus, true, "If enable status report HTTP service.")
 	statusHost      = flag.String(nmStatusHost, "0.0.0.0", "tidb server status host")
+	protocol        = flag.String(nmProtocol, "*", "server protocol")
 	statusPort      = flag.String(nmStatusPort, "10090", "tidb server status port")
 	metricsAddr     = flag.String(nmMetricsAddr, "", "prometheus pushgateway address, leaves it empty will disable prometheus push.")
 	metricsInterval = flag.Uint(nmMetricsInterval, 15, "prometheus client push interval in second, set \"0\" to disable prometheus push.")
+
+	thriftEnable = flagBoolean(nmThrift, true, "if enable hbase thrift server")
+	tTransport   = flag.String(nmThriftTransport, "buffered", "HBase thrift server transport")
+	tProtocol    = flag.String(nmThriftProtocol, "binary", "HBase thrift server protocol")
+	thriftPort   = flag.Uint(nmThriftPort, 9090, "HBase thrift server listen port")
 )
 var (
 	cfg      *config.Config
 	storage  kv.Storage
 	dom      *domain.Domain
 	svr      *server.Server
+	mysqlsvr *mysvr.Server
 	graceful bool
 )
 
 func main() {
 	flag.Parse()
 	if *version {
-		fmt.Println()
+		versionInfo := fmt.Sprintf("%v.%v.%v", ts.GitBranch, ts.GitHash, ts.BuildTS)
+		fmt.Println(versionInfo)
 		os.Exit(0)
 	}
 	registerStores()
@@ -95,6 +124,7 @@ func main() {
 	setupTracing()
 	createStoreAndDomain()
 	createServer()
+	signal.SetupSignalHandler(serverShutdown)
 	runServer()
 	cleanup()
 	syncLog()
@@ -105,8 +135,9 @@ func registerMetrics() {
 }
 
 func registerStores() {
-	err := kvstore.Register("tikv", tikv.Driver{})
+	err := kvstore.Register("tikv", zstore.Driver{})
 	terror.MustNil(err)
+	tikv.NewGCHandlerFunc = gcworker.NewGCWorker
 	err = kvstore.Register("mocktikv", mockstore.MockDriver{})
 	terror.MustNil(err)
 }
@@ -131,6 +162,28 @@ func overrideConfig() {
 	if actualFlags[nmListenPort] {
 		cfg.Port = *port
 	}
+	if actualFlags[nmListenSQLPort] {
+		cfg.SQLPort = *sqlPort
+	}
+	if actualFlags[nmAdvertiseAddress] {
+		cfg.AdvertiseAddress = *advertiseAddress
+	}
+	if len(cfg.AdvertiseAddress) == 0 {
+		cfg.AdvertiseAddress = cfg.Host
+	}
+
+	if actualFlags[nmThrift] {
+		cfg.HBase.ThriftEnable = *thriftEnable
+	}
+	if actualFlags[nmThriftPort] {
+		cfg.HBase.ThriftPort = int32(*thriftPort)
+	}
+	if actualFlags[nmThriftProtocol] {
+		cfg.HBase.ThriftProtocol = *tProtocol
+	}
+	if actualFlags[nmThriftTransport] {
+		cfg.HBase.ThriftProtocol = *tTransport
+	}
 }
 
 func setupLog() {
@@ -154,20 +207,48 @@ func setupMetrics() {
 	pushMetric(cfg.Status.MetricsAddr, time.Duration(cfg.Status.MetricsInterval)*time.Second)
 }
 
-func printInfo() {
-
-}
-
 func createServer() {
-	driver := server.NewZettaDriver(storage)
 	var err error
-	svr, err = server.NewServer(cfg, driver)
-	terror.MustNil(err)
+	if *protocol == "grpc" || *protocol == "*" {
+		driver := server.NewZettaDriver(storage)
+		svr, err = server.NewServer(cfg, driver)
+		terror.MustNil(err)
+	}
+	if *protocol == "mysql" || *protocol == "*" {
+		zdriver := mysvr.NewZDBDriver(storage)
+		mysqlsvr, err = mysvr.NewServer(cfg, zdriver)
+		terror.MustNil(err)
+	}
 }
 
+// TODO: Run grpc and mysql protocol at the same time.
 func runServer() {
-	err := svr.Run()
-	terror.MustNil(err)
+	var err error
+	switch *protocol {
+	case "grpc":
+		err = svr.Run()
+		terror.MustNil(err)
+	case "mysql":
+		err = mysqlsvr.Run()
+		terror.MustNil(err)
+	case "*":
+		go func() {
+			err = svr.Run()
+			terror.MustNil(err)
+		}()
+		err = mysqlsvr.Run()
+		terror.MustNil(err)
+	default:
+		err = svr.Run()
+		terror.MustNil(err)
+	}
+}
+
+func closeDomainAndStorage() {
+	atomic.StoreUint32(&tikv.ShuttingDown, 1)
+	dom.Close()
+	err := storage.Close()
+	terror.Log(errors.Trace(err))
 }
 
 func createStoreAndDomain() {
@@ -175,18 +256,23 @@ func createStoreAndDomain() {
 	var err error
 	storage, err = kvstore.New(fullPath)
 	terror.MustNil(err)
-	dom, err = domain.Bootstrap(storage)
+	createSessionFunc := func() (pools.Resource, error) {
+		return mysvr.CreateSession(storage)
+	}
+	dom, err = domain.Bootstrap(storage, createSessionFunc)
 	terror.MustNil(err)
 }
 
 func serverShutdown(isgraceful bool) {
 	if isgraceful {
-
+		graceful = true
 	}
+	mysqlsvr.Close()
+	svr.Close()
 }
 
 func cleanup() {
-
+	closeDomainAndStorage()
 }
 
 func syncLog() {

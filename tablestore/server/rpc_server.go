@@ -244,7 +244,16 @@ func (rs *RPCServer) Read(ctx context.Context, req *tspb.ReadRequest) (*tspb.Res
 	}
 	sess := queryCtx.GetSession()
 	sess.SetLastActive(time.Now())
-	txn, err := sess.RetrieveTxn(ctx, req.GetTransaction(), false)
+
+	isRawkv, err := sess.RawkvAccess(ctx, req.Table)
+	if err != nil {
+		return nil, status.Error(codes.Aborted, err.Error())
+	}
+	rtOpt := session.RetrieveTxnOpt{
+		Committable: false,
+		IsRawKV:     isRawkv,
+	}
+	txn, err := sess.RetrieveTxn(ctx, req.GetTransaction(), &rtOpt)
 	if err != nil {
 		readCounterGerneralErr.Inc()
 		logutil.Logger(ctx).Error("fetch transaction error", zap.Error(err))
@@ -311,7 +320,75 @@ func (rs *RPCServer) SparseRead(ctx context.Context, req *tspb.SparseReadRequest
 	}
 	sess := queryCtx.GetSession()
 	sess.SetLastActive(time.Now())
-	txn, err := sess.RetrieveTxn(ctx, req.GetTransaction(), false)
+
+	isRawkv, err := sess.RawkvAccess(ctx, req.Table)
+	if err != nil {
+		return nil, status.Error(codes.Aborted, err.Error())
+	}
+	rtOpt := session.RetrieveTxnOpt{
+		Committable: false,
+		IsRawKV:     isRawkv,
+	}
+
+	txn, err := sess.RetrieveTxn(ctx, req.GetTransaction(), &rtOpt)
+	if err != nil {
+		sparseReadCounterGerneralErr.Inc()
+		logutil.Logger(ctx).Error("fetch transaction error", zap.Error(err))
+		return nil, err
+	}
+	startTS := time.Now()
+	ri, err := queryCtx.GetSession().HandleRead(ctx, req, txn)
+	if err != nil {
+		sparseReadCounterGerneralErr.Inc()
+		logutil.Logger(ctx).Error("read error", zap.Error(err))
+		return nil, err
+	}
+	resultSet, err := rs.readRows(ctx, ri)
+	durRead := time.Since(startTS)
+	if err != nil {
+		executeReadDurationGeneralErr.Observe(durRead.Seconds())
+		sparseReadCounterGerneralErr.Inc()
+		return resultSet, err
+	}
+	executeReadDurationGeneralOK.Observe(durRead.Seconds())
+	sparseReadCounterGerneralOK.Inc()
+	return resultSet, nil
+}
+
+// SparseScan reads rows from the database using key lookups and scans, as a
+// simple key/value style alternative to
+func (rs *RPCServer) SparseScan(ctx context.Context, req *tspb.SparseScanRequest) (*tspb.ResultSet, error) {
+
+	queryCtx, err := rs.getQueryCtxBySessionID(req.Session)
+	if err != nil {
+		sparseReadCounterGerneralErr.Inc()
+		return nil, err
+	}
+	if len(req.ResumeToken) > 0 {
+		// This should only happen if we send resume_token ourselves.
+		return nil, fmt.Errorf("read resumption not supported")
+	}
+	if len(req.PartitionToken) > 0 {
+		return nil, fmt.Errorf("partition restrictions not supported")
+	}
+
+	if req.GetTransaction() == nil {
+		sparseReadCounterGerneralErr.Inc()
+		return nil, status.Error(codes.FailedPrecondition, "no transaction selector in grpc request")
+	}
+	sess := queryCtx.GetSession()
+	sess.SetLastActive(time.Now())
+
+	isRawkv, err := sess.RawkvAccess(ctx, req.Table)
+	if err != nil {
+		return nil, status.Error(codes.Aborted, err.Error())
+	}
+	rtOpt := session.RetrieveTxnOpt{
+		Committable: false,
+		IsRawKV:     isRawkv,
+	}
+
+	txn, err := sess.RetrieveTxn(ctx, req.GetTransaction(), &rtOpt)
 	if err != nil {
 		sparseReadCounterGerneralErr.Inc()
 		logutil.Logger(ctx).Error("fetch transaction error", zap.Error(err))
@@ -349,7 +426,17 @@ func (rs *RPCServer) Mutate(ctx context.Context, req *tspb.MutationRequest) (*ts
 	if req.GetTransaction() == nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "transaction selector should be specific")
 	}
-	txn, err := sess.RetrieveTxn(ctx, req.GetTransaction(), false)
+
+	isRawkv, err := sess.RawkvAccess(ctx, req.Table)
+	if err != nil {
+		return nil, status.Error(codes.Aborted, err.Error())
+	}
+	rtOpt := session.RetrieveTxnOpt{
+		Committable: true,
+		IsRawKV:     isRawkv,
+	}
+
+	txn, err := sess.RetrieveTxn(ctx, req.GetTransaction(), &rtOpt)
 	if err != nil {
 		mutateCounterGerneralErr.Inc()
 		return nil, status.Errorf(codes.Aborted, "retrieve session transaction failed %v", err)
@@ -375,9 +462,19 @@ func (rs *RPCServer) StreamingRead(req *tspb.ReadRequest, stream tspb.Tablestore
 		streamReadCounterGerneralErr.Inc()
 		return err
 	}
-	session := queryCtx.GetSession()
-	session.SetLastActive(time.Now())
-	txn, err := session.RetrieveTxn(stream.Context(), req.GetTransaction(), false)
+	sess := queryCtx.GetSession()
+	sess.SetLastActive(time.Now())
+
+	isRawkv, err := sess.RawkvAccess(stream.Context(), req.Table)
+	if err != nil {
+		return status.Error(codes.Aborted, err.Error())
+	}
+	rtOpt := session.RetrieveTxnOpt{
+		Committable: false,
+		IsRawKV:     isRawkv,
+	}
+
+	txn, err := sess.RetrieveTxn(stream.Context(), req.GetTransaction(), &rtOpt)
 	if err != nil {
 		streamReadCounterGerneralErr.Inc()
 		logutil.Logger(stream.Context()).Error("fetch transaction error", zap.Error(err))
@@ -436,9 +533,19 @@ func (rs *RPCServer) StreamingSparseRead(req *tspb.SparseReadRequest, stream tsp
 		streamReadCounterGerneralErr.Inc()
 		return err
 	}
-	session := queryCtx.GetSession()
-	session.SetLastActive(time.Now())
-	txn, err := session.RetrieveTxn(stream.Context(), req.GetTransaction(), false)
+	sess := queryCtx.GetSession()
+	sess.SetLastActive(time.Now())
+
+	isRawkv, err := sess.RawkvAccess(stream.Context(), req.Table)
+	if err != nil {
+		return status.Error(codes.Aborted, err.Error())
+	}
+	rtOpt := session.RetrieveTxnOpt{
+		Committable: false,
+		IsRawKV:     isRawkv,
+	}
+
+	txn, err := sess.RetrieveTxn(stream.Context(), req.GetTransaction(), &rtOpt)
 	if err != nil {
 		streamReadCounterGerneralErr.Inc()
 		logutil.Logger(stream.Context()).Error("fetch transaction error", zap.Error(err))
@@ -448,7 +555,43 @@ func (rs *RPCServer) StreamingSparseRead(req *tspb.SparseReadRequest, stream tsp
 	ri, err := queryCtx.GetSession().HandleRead(ctx, req, txn)
 	if err != nil {
 		streamReadCounterGerneralErr.Inc()
-		logutil.Logger(stream.Context()).Error("mutate error", zap.Error(err))
+		logutil.Logger(stream.Context()).Error("stream sparse read error", zap.Error(err))
+		return status.Error(codes.Aborted, err.Error())
+	}
+
+	return rs.readStream(ctx, ri, stream.Send)
+}
+
+// StreamingSparseScan xxx
+func (rs *RPCServer) StreamingSparseScan(req *tspb.SparseScanRequest, stream tspb.Tablestore_StreamingSparseScanServer) error {
+	queryCtx, err := rs.getQueryCtxBySessionID(req.Session)
+	if err != nil {
+		streamReadCounterGerneralErr.Inc()
+		return err
+	}
+	sess := queryCtx.GetSession()
+	sess.SetLastActive(time.Now())
+
+	isRawkv, err := sess.RawkvAccess(stream.Context(), req.Table)
+	if err != nil {
+		return status.Error(codes.Aborted, err.Error())
+	}
+	rtOpt := session.RetrieveTxnOpt{
+		Committable: false,
+		IsRawKV:     isRawkv,
+	}
+
+	txn, err := sess.RetrieveTxn(stream.Context(), req.GetTransaction(), &rtOpt)
+	if err != nil {
+		streamReadCounterGerneralErr.Inc()
+		logutil.Logger(stream.Context()).Error("fetch transaction error", zap.Error(err))
+		return err
+	}
+	ctx := sessionctx.SetStreamReadKey(stream.Context())
+	ri, err := queryCtx.GetSession().HandleRead(ctx, req, txn)
+	if err != nil {
+		streamReadCounterGerneralErr.Inc()
+		logutil.Logger(stream.Context()).Error("stream sparse read error", zap.Error(err))
 		return status.Error(codes.Aborted, err.Error())
 	}
 
@@ -461,14 +604,14 @@ func (rs *RPCServer) BeginTransaction(ctx context.Context, req *tspb.BeginTransa
 	if err != nil {
 		return nil, err
 	}
-	session := queryCtx.GetSession()
-	session.SetLastActive(time.Now())
+	sess := queryCtx.GetSession()
+	sess.SetLastActive(time.Now())
 	txnSel := &tspb.TransactionSelector{
 		Selector: &tspb.TransactionSelector_Begin{
 			Begin: req.GetOptions(),
 		},
 	}
-	txn, err := session.RetrieveTxn(ctx, txnSel, false)
+	txn, err := sess.RetrieveTxn(ctx, txnSel, nil)
 	if err != nil {
 		logutil.Logger(ctx).Error("session retrieve transaction error", zap.Error(err), zap.String("session", req.Session))
 		return nil, status.Errorf(codes.Internal, "begin transaction error %v", err)
@@ -508,7 +651,19 @@ func (rs *RPCServer) Commit(ctx context.Context, req *tspb.CommitRequest) (*tspb
 	default:
 		return nil, status.Errorf(codes.Aborted, "unsupported transaction type %T", req.Transaction)
 	}
-	txn, err := sess.RetrieveTxn(ctx, txnSel, true)
+	if len(req.Table) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "missing field <table>")
+	}
+	isRawkv, err := sess.RawkvAccess(ctx, req.Table)
+	if err != nil {
+		return nil, status.Error(codes.Aborted, err.Error())
+	}
+	rtOpt := session.RetrieveTxnOpt{
+		Committable: true,
+		IsRawKV:     isRawkv,
+	}
+
+	txn, err := sess.RetrieveTxn(ctx, txnSel, &rtOpt)
 	if err != nil {
 		commitCounterGerneralErr.Inc()
 		return nil, status.Errorf(codes.Aborted, "retrieve session transaction failed %v", err)
@@ -538,7 +693,7 @@ func (rs *RPCServer) Rollback(ctx context.Context, req *tspb.RollbackRequest) (*
 		Selector: &tspb.TransactionSelector_Id{Id: req.TransactionId},
 	}
 
-	txn, err := sess.RetrieveTxn(ctx, txnSel, true)
+	txn, err := sess.RetrieveTxn(ctx, txnSel, nil)
 	if err != nil {
 		return nil, status.Errorf(codes.Aborted, "retrieve session transaction failed %v", err)
 	}

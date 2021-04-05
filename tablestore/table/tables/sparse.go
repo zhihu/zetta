@@ -50,6 +50,8 @@ var (
 	scanSparseDurationOK = metrics.ScanSparseDuration.WithLabelValues(metrics.LblOK)
 )
 
+const streamingBatchSize = 1000
+
 type sparseRow struct {
 	idx        int
 	raw        *tspb.Row
@@ -58,96 +60,127 @@ type sparseRow struct {
 	rkeyPrefix kv.Key
 }
 
-func (t *tableCommon) ReadSparse(ctx context.Context, req *tspb.SparseReadRequest) (*resultIter, error) {
+type sparseContext struct {
+	cf      *model.ColumnFamilyMeta
+	rowKeys []kv.Key
+	cellMap map[string]*sparseRow
+	srows   []*sparseRow
+}
 
-	if len(req.Family) == 0 {
-		return nil, status.Error(codes.FailedPrecondition, "family must be specific")
+func buildSparseContext(cf *model.ColumnFamilyMeta) *sparseContext {
+	return &sparseContext{
+		cf:      cf,
+		rowKeys: []kv.Key{},
+		cellMap: map[string]*sparseRow{},
+		srows:   []*sparseRow{},
 	}
+}
+
+func (t *tableCommon) ReadSparse(ctx context.Context, req *tspb.SparseReadRequest) (*resultIter, error) {
 
 	if req.Family == DefaultColumnFamily {
 		return nil, status.Error(codes.FailedPrecondition, "default column family not suitable for sparse read")
 	}
 
-	rkeys, cellMap, srows, cf, err := t.prepareRowKeys(ctx, req)
+	sparseCtxs, _, err := t.prepareRowKeys(ctx, req)
 	if err != nil {
 		return nil, err
 	}
 
-	ri := &resultIter{
-		rowChan: make(chan *tspb.SliceCell, 32),
-		limit:   req.Limit,
-	}
+	ri := NewResultIter(req.Limit)
 
 	go func() {
 		defer ri.Close()
-		startTS := time.Now()
-		err := t.fetchSparse(ctx, rkeys, cellMap, srows, cf, ri)
-		durFetchSparse := time.Since(startTS)
-		if err != nil {
-			fetchSparseCounterErr.Inc()
-			fetchSparseDurationErr.Observe(durFetchSparse.Seconds())
-			ri.lastErr = err
-			logutil.Logger(ctx).Error("fetch sparse value err", zap.Error(err))
-			return
+		for _, sparseCtx := range sparseCtxs {
+			startTS := time.Now()
+			err := t.fetchSparse(ctx, sparseCtx, ri)
+			durFetchSparse := time.Since(startTS)
+			if err != nil {
+				fetchSparseCounterErr.Inc()
+				fetchSparseDurationErr.Observe(durFetchSparse.Seconds())
+				ri.lastErr = err
+				logutil.Logger(ctx).Error("fetch sparse value err", zap.Error(err))
+				return
+			}
+			fetchSparseDurationOK.Observe(durFetchSparse.Seconds())
+			fetchSparseCounterOK.Inc()
 		}
-		fetchSparseDurationOK.Observe(durFetchSparse.Seconds())
-		fetchSparseCounterOK.Inc()
 	}()
 	return ri, nil
 }
 
-func (t *tableCommon) prepareRowKeys(ctx context.Context, sr *tspb.SparseReadRequest) ([]kv.Key, map[string]*sparseRow, []*sparseRow, *model.ColumnFamilyMeta, error) {
+func (t *tableCommon) prepareRowKeys(ctx context.Context, sr *tspb.SparseReadRequest) ([]*sparseContext, []*model.ColumnFamilyMeta, error) {
 	var (
-		rowKeys = []kv.Key{}
-		cellMap = map[string]*sparseRow{}
-		srows   = []*sparseRow{}
+		sparseCtxs = []*sparseContext{}
+		cfList     = []*model.ColumnFamilyMeta{}
 	)
-	cf, ok := t.cfIDMap[sr.Family]
-	if !ok {
-		return nil, nil, nil, nil, status.Errorf(codes.NotFound, "column family: %v not found", sr.Family)
+	if sr.Family == "" {
+		for _, cf := range t.cfIDMap {
+			if isFlexible(cf) {
+				cfList = append(cfList, cf)
+				sparseCtx := buildSparseContext(cf)
+				sparseCtxs = append(sparseCtxs, sparseCtx)
+			}
+		}
+	} else {
+		cf, ok := t.cfIDMap[sr.Family]
+		if !ok {
+			return nil, nil, status.Errorf(codes.NotFound, "column family: %v not found", sr.Family)
+		}
+		if !isFlexible(cf) {
+			return nil, nil, status.Errorf(codes.Canceled, "columns famliy %v mode not flexible", sr.Family)
+		}
+
+		cfList = append(cfList, cf)
+		sparseCtx := buildSparseContext(cf)
+		sparseCtxs = append(sparseCtxs, sparseCtx)
 	}
-	for i, row := range sr.Rows {
-		pkeyDatums, err := t.getPrimaryKeyData(ctx, row.Keys)
-		if err != nil {
-			return nil, nil, nil, nil, status.Error(codes.Aborted, err.Error())
-		}
-		rkeyPrefix, err := genRecordPrimaryCFPrefix(t.tableID, pkeyDatums, cf.Id)
-		if err != nil {
-			return nil, nil, nil, nil, status.Error(codes.Aborted, err.Error())
-		}
 
-		srow := &sparseRow{
-			idx:        i,
-			raw:        row,
-			rkeyPrefix: rkeyPrefix,
-			rowCells: &tspb.SliceCell{
-				PrimaryKeys: row.Keys.Values,
-				Cells:       []*tspb.Cell{},
-			},
-		}
+	for scid, cf := range cfList {
+		for i, row := range sr.Rows {
+			pkeyDatums, err := t.getPrimaryKeyData(ctx, row.Keys)
+			if err != nil {
+				return nil, nil, status.Error(codes.Aborted, err.Error())
+			}
+			rkeyPrefix, err := genRecordPrimaryCFPrefix(t.tableID, pkeyDatums, cf.Id)
+			if err != nil {
+				return nil, nil, status.Error(codes.Aborted, err.Error())
+			}
+			srow := &sparseRow{
+				idx:        i,
+				raw:        row,
+				rkeyPrefix: rkeyPrefix,
+				rowCells: &tspb.SliceCell{
+					PrimaryKeys: row.Keys.Values,
+					Cells:       []*tspb.Cell{},
+				},
+			}
 
-		srows = append(srows, srow)
-		qLen := len(row.Qualifiers)
-		if qLen == 0 {
-			srow.entireRow = true
-			srow.rowCells.Cells = make([]*tspb.Cell, 0, 200000)
-			continue
-		}
-		srow.rowCells.Cells = make([]*tspb.Cell, 0, qLen)
-
-		for _, col := range row.Qualifiers {
-			rkey := tablecodec.EncodePkCFColumn(rkeyPrefix, []byte(col))
-			rowKeys = append(rowKeys, rkey)
-			cellMap[string(rkey)] = srow
+			sparseCtxs[scid].srows = append(sparseCtxs[scid].srows, srow)
+			if len(row.Qualifiers) == 0 {
+				srow.entireRow = true
+				continue
+			}
+			for _, col := range row.Qualifiers {
+				rkey := tablecodec.EncodePkCFColumn(rkeyPrefix, []byte(col))
+				sparseCtxs[scid].rowKeys = append(sparseCtxs[scid].rowKeys, rkey)
+				sparseCtxs[scid].cellMap[string(rkey)] = srow
+			}
 		}
 	}
-	return rowKeys, cellMap, srows, cf, nil
+	return sparseCtxs, cfList, nil
 }
 
-func (t *tableCommon) fetchSparse(ctx context.Context, rowKeys []kv.Key, cellMap map[string]*sparseRow, srows []*sparseRow, cf *model.ColumnFamilyMeta, ri *resultIter) error {
+func (t *tableCommon) fetchSparse(ctx context.Context, sparseCtx *sparseContext, ri *resultIter) error {
+
 	var (
 		wg         sync.WaitGroup
 		err1, err2 error
+
+		rowKeys = sparseCtx.rowKeys
+		cellMap = sparseCtx.cellMap
+		srows   = sparseCtx.srows
+		cf      = sparseCtx.cf
 	)
 	streamRead := sessionctx.StreamReadFromContext(ctx)
 	startTs := time.Now()
@@ -186,6 +219,7 @@ func (t *tableCommon) fetchSparse(ctx context.Context, rowKeys []kv.Key, cellMap
 	if !streamRead {
 		for _, srow := range srows {
 			ri.sendData(srow.rowCells)
+
 		}
 	}
 	return nil
@@ -199,7 +233,7 @@ func (t *tableCommon) readSparseBatch(ctx context.Context, rowKeys []kv.Key, cel
 		preIdx                = -1
 		preSrow    *sparseRow = nil
 	)
-	valsMap, err := txn.BatchGet(rowKeys)
+	valsMap, err := txn.BatchGet(ctx, rowKeys)
 	if err != nil {
 		logutil.Logger(ctx).Error("batch get row value error", zap.Error(err))
 		return err
@@ -213,7 +247,7 @@ func (t *tableCommon) readSparseBatch(ctx context.Context, rowKeys []kv.Key, cel
 		srow := cellMap[string(rowKeys[i])]
 		if srow.idx > preIdx {
 			if preSrow != nil && streamRead {
-				if err := ri.sendData(preSrow.rowCells); err == table.ErrUserLimitReached {
+				if err := ri.sendData(preSrow.rowCells); err == table.ErrResultSetUserLimitReached {
 					return nil
 				}
 			}
@@ -251,55 +285,129 @@ func (t *tableCommon) readSparseBatch(ctx context.Context, rowKeys []kv.Key, cel
 	return nil
 }
 
+type kvPair struct {
+	key   []byte
+	value []byte
+	sRow  *sparseRow
+	err   error
+}
+
 func (t *tableCommon) scanSparseRow(ctx context.Context, srows []*sparseRow, cf *model.ColumnFamilyMeta, ri *resultIter) error {
+	if len(srows) == 0 {
+		return nil
+	}
+
 	var (
-		txn        = ctx.Value(sessionctx.TxnIDKey).(kv.Transaction)
-		sc         = &stmtctx.StatementContext{TimeZone: time.Local}
-		streamRead = sessionctx.StreamReadFromContext(ctx)
+		txn              = ctx.Value(sessionctx.TxnIDKey).(kv.Transaction)
+		sc               = &stmtctx.StatementContext{TimeZone: time.Local}
+		streamRead       = sessionctx.StreamReadFromContext(ctx)
+		streamBatchIndex = 0
 	)
 
-	for _, srow := range srows {
-		if !srow.entireRow {
-			continue
+	var cells []*tspb.Cell
+	kvPairChan := make(chan *kvPair, 10000)
+	defer close(kvPairChan)
+
+	go func() {
+		for _, srow := range srows {
+			if !srow.entireRow {
+				continue
+			}
+			iter, err := txn.Iter(srow.rkeyPrefix, srow.rkeyPrefix.PrefixNext())
+			if err != nil {
+				logutil.Logger(ctx).Error("get iterator error", zap.Error(err))
+				pair := &kvPair{
+					err: err,
+				}
+				kvPairChan <- pair
+				return
+			}
+			defer iter.Close()
+			for iter.Valid() {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					logutil.Logger(ctx).Error("Client canceled scan", zap.Error(ctxErr))
+					pair := &kvPair{
+						err: ctxErr,
+					}
+					kvPairChan <- pair
+					return
+				}
+				pair := &kvPair{
+					key:   iter.Key(),
+					value: iter.Value(),
+					sRow:  srow,
+				}
+				kvPairChan <- pair
+				iter.Next()
+			}
 		}
-		iter, err := txn.Iter(srow.rkeyPrefix, srow.rkeyPrefix.PrefixNext())
+		kvPairChan <- nil
+	}()
+
+	srow := srows[0]
+
+	for pair := range kvPairChan {
+		if pair != nil && pair.err != nil {
+			return pair.err
+		}
+
+		if pair == nil || pair.sRow != srow {
+			if streamBatchIndex > 0 {
+				rowCells := &tspb.SliceCell{
+					PrimaryKeys: srow.rowCells.PrimaryKeys,
+					Cells:       cells[:streamBatchIndex],
+				}
+				if err := ri.sendData(rowCells); err != nil {
+					return err
+				}
+				streamBatchIndex = 0
+			}
+
+			if pair == nil {
+				return nil
+			}
+
+			srow = pair.sRow
+		}
+
+		datum, err := tablecodec.DecodeRowHigh(sc, pair.value, nil, time.Local)
 		if err != nil {
-			logutil.Logger(ctx).Error("get iterator error", zap.Error(err))
 			return err
 		}
-		for iter.Valid() {
-			datum, err := tablecodec.DecodeRowHigh(sc, iter.Value(), nil, time.Local)
-			if err != nil {
-				return err
-			}
-			pv, _, err := flexibleProtoValueFromDatum(datum)
-			if err != nil {
-				logutil.Logger(ctx).Error("gen proto value error", zap.Error(err))
-				return err
-			}
-			column := iter.Key()[len(srow.rkeyPrefix):]
+		pv, _, err := flexibleProtoValueFromDatum(datum)
+		if err != nil {
+			logutil.Logger(ctx).Error("gen proto value error", zap.Error(err))
+			return err
+		}
+		column := pair.key[len(srow.rkeyPrefix):]
 
-			cell := &tspb.Cell{
-				Family: cf.Name,
-				Column: string(column),
-				Type:   &tspb.Type{Code: tspb.TypeCode_TYPE_CODE_UNSPECIFIED},
-				Value:  pv,
-			}
-			if srow.rowCells == nil {
-				srow.rowCells = &tspb.SliceCell{
-					PrimaryKeys: srow.raw.Keys.Values,
-					Cells:       []*tspb.Cell{},
-				}
-			}
-			srow.rowCells.Cells = append(srow.rowCells.Cells, cell)
-			iter.Next()
+		cell := &tspb.Cell{
+			Family: cf.Name,
+			Column: string(column),
+			Type:   &tspb.Type{Code: tspb.TypeCode_TYPE_CODE_UNSPECIFIED},
+			Value:  pv,
 		}
 		if streamRead {
-			if err := ri.sendData(srow.rowCells); err != nil {
-				return err
+			if streamBatchIndex == 0 {
+				cells = make([]*tspb.Cell, streamingBatchSize)
 			}
+			cells[streamBatchIndex] = cell
+			streamBatchIndex++
+			if streamBatchIndex >= streamingBatchSize {
+				streamBatchIndex = 0
+				rowCells := &tspb.SliceCell{
+					PrimaryKeys: srow.rowCells.PrimaryKeys,
+					Cells:       cells,
+				}
+				if err := ri.sendData(rowCells); err != nil {
+					return err
+				}
+			}
+		} else {
+			srow.rowCells.Cells = append(srow.rowCells.Cells, cell)
 		}
 	}
+
 	return nil
 }
 

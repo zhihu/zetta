@@ -33,6 +33,10 @@ import (
 	"github.com/zhihu/zetta/tablestore/table"
 )
 
+var (
+	_ table.Table = (*Table)(nil)
+)
+
 const (
 	DefaultColumnFamily = "default"
 
@@ -44,8 +48,6 @@ const (
 	AttrCompact  = "compact"
 	AttrSparse   = "sparse"
 )
-
-var ()
 
 type tableCommon struct {
 	Database string
@@ -70,7 +72,8 @@ type tableCommon struct {
 	// reverse index for columns
 	revIndex map[int]int
 	// columnId -> fieldType map
-	colFtMap map[int64]*types.FieldType
+	colFtMap   map[int64]*types.FieldType
+	pkColTypes []*types.FieldType
 
 	colCfMap map[string]string
 	cfIDMap  map[string]*model.ColumnFamilyMeta
@@ -86,6 +89,14 @@ type Table struct {
 
 func (t *Table) GetPhysicalID() int64 {
 	return t.physicalTableID
+}
+
+func (t *Table) Cols() []*table.Column {
+	cols := make([]*table.Column, len(t.Columns))
+	for i := range t.Columns {
+		cols[i] = table.ToColumn(t.Columns[i])
+	}
+	return cols
 }
 
 var _ table.Table = &Table{}
@@ -105,7 +116,8 @@ func MakeTableFromMeta(tableMeta *model.TableMeta) table.Table {
 		colIndex: make(map[string]int),
 		revIndex: make(map[int]int),
 
-		colFtMap: make(map[int64]*types.FieldType),
+		colFtMap:   make(map[int64]*types.FieldType),
+		pkColTypes: make([]*types.FieldType, len(tableMeta.PrimaryKey)),
 
 		colCfMap: make(map[string]string),
 		cfIDMap:  make(map[string]*model.ColumnFamilyMeta),
@@ -114,18 +126,21 @@ func MakeTableFromMeta(tableMeta *model.TableMeta) table.Table {
 	}
 	for i, col := range t.Columns {
 		if col.IsPrimary {
-			t.pkeyMap[col.Name] = i
+			t.pkeyMap[col.ColumnMeta.Name] = i
 		}
+		col.Offset = i
 
-		t.colIndex[col.Name] = i
-		t.colFtMap[col.Id] = col.FieldType
-		t.colCfMap[col.Name] = col.Family
+		t.colIndex[col.ColumnMeta.Name] = i
+		t.colFtMap[col.Id] = &col.FieldType
+		t.colCfMap[col.ColumnMeta.Name] = col.Family
 	}
 
-	for _, pkey := range tableMeta.PrimaryKey {
+	for i, pkey := range tableMeta.PrimaryKey {
 		colMeta := t.Columns[t.colIndex[pkey]]
+		colMeta.IsPrimary = true
 		t.pkeys = append(t.pkeys, colMeta)
 		t.pkeyMap[pkey] = t.colIndex[pkey]
+		t.pkColTypes[i] = &colMeta.FieldType
 	}
 
 	for _, index := range tableMeta.Indices {
@@ -136,7 +151,6 @@ func MakeTableFromMeta(tableMeta *model.TableMeta) table.Table {
 
 	for _, cf := range tableMeta.ColumnFamilies {
 		t.cfIDMap[cf.Name] = cf
-
 	}
 	t.defaultCFID = t.cfIDMap[DefaultColumnFamily].GetId()
 
@@ -174,10 +188,11 @@ func TableFromMeta(tableMeta *model.TableMeta, txn kv.Transaction) table.Table {
 
 		meta: tableMeta,
 	}
+
 	for i, col := range t.Columns {
-		t.colIndex[col.Name] = i
-		t.colFtMap[col.Id] = col.FieldType
-		t.colCfMap[col.Name] = col.Family
+		t.colIndex[col.ColumnMeta.Name] = i
+		t.colFtMap[col.Id] = &col.FieldType
+		t.colCfMap[col.ColumnMeta.Name] = col.Family
 	}
 
 	for _, pkey := range tableMeta.PrimaryKey {
@@ -197,6 +212,19 @@ func TableFromMeta(tableMeta *model.TableMeta, txn kv.Transaction) table.Table {
 	}
 
 	return &Table{t}
+}
+
+func (t *tableCommon) isRaw() bool {
+	var mode string
+	var ok bool
+	if mode, ok = t.meta.Attributes["AccessMode"]; !ok {
+		return false
+	}
+	return mode == "rawkv"
+}
+
+func (t *tableCommon) ColumnFamilies() []*model.ColumnFamilyMeta {
+	return t.CFs
 }
 
 func (t *tableCommon) Meta() *model.TableMeta {
@@ -220,35 +248,44 @@ func (t *tableCommon) getCF(cfID int64) *model.ColumnFamilyMeta {
 	return nil
 }
 
-func (t *tableCommon) prepareCFColumns(rowkeys *tspb.ListValue, family string, columns []string) (cols []*columnEntry, pks []types.Datum, cfMeta *model.ColumnFamilyMeta, colmap map[string]*columnEntry, err error) {
-	_, err = CheckOnce(columns)
+func (t *tableCommon) prepareCFColumns(rowkeys *tspb.ListValue, family string, columns []string) (*mutationContext, error) {
+	_, err := CheckOnce(columns)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, err
 	}
-	cols = []*columnEntry{}
-	colmap = make(map[string]*columnEntry)
+
+	mutCtx := &mutationContext{
+		pkmap:  make(map[string]int),
+		cols:   []*columnEntry{},
+		colmap: make(map[string]*columnEntry),
+	}
 	if family == "" {
 		family = DefaultColumnFamily
 	}
 	cf, ok := t.cfIDMap[family]
 	if !ok {
-		return nil, nil, nil, nil, status.Errorf(codes.FailedPrecondition, "cf %s not in table %s", family, t.meta.TableName)
+		return nil, status.Errorf(codes.FailedPrecondition, "cf %s not in table %s", family, t.meta.TableName)
 	}
-	cfMeta = cf
+	mutCtx.cf = cf
 	for j, col := range columns {
 		var entry *columnEntry
 		if !isFlexible(cf) {
 			i, ok := t.colIndex[col]
 			if !ok {
-				return nil, nil, nil, nil, status.Errorf(codes.InvalidArgument, "column %s not in table %s", col, t.meta.TableName)
+				return nil, status.Errorf(codes.InvalidArgument, "column %s not in table `%s`", col, t.meta.TableName)
+			}
+			if family == DefaultColumnFamily {
+				if _, ok := t.pkeyMap[col]; ok {
+					return nil, status.Errorf(codes.InvalidArgument, "primary key column `%v` appears", col)
+				}
 			}
 			entry = &columnEntry{
 				id:   t.Columns[i].Id,
-				name: t.Columns[i].Name,
+				name: t.Columns[i].ColumnMeta.Name,
 				t:    t.Columns[i].ColumnType,
 				cfID: t.cfIDMap[t.Columns[i].Family].Id,
 				cf:   t.Columns[i].Family,
-				ft:   t.Columns[i].FieldType,
+				ft:   &t.Columns[i].FieldType,
 				idx:  j,
 			}
 		} else {
@@ -261,15 +298,18 @@ func (t *tableCommon) prepareCFColumns(rowkeys *tspb.ListValue, family string, c
 				idx:  j,
 			}
 		}
-		cols = append(cols, entry)
-		colmap[col] = entry
-	}
-	pks, err = t.buildPrimaryKeyValues(rowkeys)
-	if err != nil {
-		return nil, nil, nil, nil, err
+		mutCtx.cols = append(mutCtx.cols, entry)
+		mutCtx.colmap[col] = entry
 	}
 
-	return cols, pks, cfMeta, colmap, nil
+	mutCtx.pks, err = t.buildPrimaryKeyValues(rowkeys)
+	if err != nil {
+		return nil, err
+	}
+	for i, pkey := range t.pkeys {
+		mutCtx.pkmap[pkey.ColumnMeta.Name] = i
+	}
+	return mutCtx, nil
 }
 
 //assert columns valid
@@ -299,11 +339,11 @@ func (t *tableCommon) prepareColumns(columns []string) (cols []*columnEntry, pks
 			}
 			entry = &columnEntry{
 				id:   t.Columns[i].Id,
-				name: t.Columns[i].Name,
+				name: t.Columns[i].ColumnMeta.Name,
 				t:    t.Columns[i].ColumnType,
 				cfID: t.cfIDMap[t.Columns[i].Family].Id,
 				cf:   t.Columns[i].Family,
-				ft:   t.Columns[i].FieldType,
+				ft:   &t.Columns[i].FieldType,
 				idx:  j,
 			}
 		} else {
@@ -338,16 +378,16 @@ func (t *tableCommon) isColumnFlexsible(col *columnEntry) bool {
 	return isFlexible(cf)
 }
 
-func (t *tableCommon) prefetchDataCache(cols []*columnEntry, lvs []*tspb.ListValue) (rows [][]types.Datum, err error) {
+func (t *tableCommon) prefetchDataCache(mutCtx *mutationContext, lvs []*tspb.ListValue) (rows [][]types.Datum, err error) {
 	for _, lv := range lvs {
-		if len(cols) != len(lv.Values) {
+		if len(mutCtx.cols) != len(lv.Values) {
 			return nil, status.Errorf(codes.FailedPrecondition, "cols num not match value")
 		}
 		row := []types.Datum{}
 		for i, v := range lv.GetValues() {
 			var datum types.Datum
-			if !t.isColumnFlexsible(cols[i]) {
-				datum, err = datumFromTypeValue(cols[i].t, v)
+			if !t.isColumnFlexsible(mutCtx.cols[i]) {
+				datum, err = datumFromTypeValue(mutCtx.cols[i].t, v)
 				if err != nil {
 					return nil, err
 				}
@@ -370,7 +410,7 @@ func (t *tableCommon) primaryKeyCols(cols []*columnEntry) ([]*columnEntry, error
 	for _, pkey := range t.pkeys {
 		var i int
 		for i = 0; i < len(cols); i++ {
-			if pkey.Name == cols[i].name {
+			if pkey.ColumnMeta.Name == cols[i].name {
 				break
 			}
 		}
@@ -382,20 +422,42 @@ func (t *tableCommon) primaryKeyCols(cols []*columnEntry) ([]*columnEntry, error
 	return entrys, nil
 }
 
-// func (t *tableCommon) buildPrimaryKeyValues
-
 func (t *tableCommon) getCFColumns(cf *model.ColumnFamilyMeta) []string {
 	cols := []string{}
 	if !isFlexible(cf) {
 		for _, col := range t.Columns {
 			if col.GetFamily() == cf.Name {
-				cols = append(cols, col.Name)
+				cols = append(cols, col.ColumnMeta.Name)
 			}
 		}
 	}
 	return cols
 }
 
+func (t *tableCommon) getCFColEntries(cf *model.ColumnFamilyMeta) []*columnEntry {
+	cols := []*columnEntry{}
+	if !isFlexible(cf) {
+		for _, col := range t.Columns {
+			if col.GetFamily() == cf.Name {
+				colEntry := &columnEntry{
+					id:   col.Id,
+					name: col.ColumnMeta.Name,
+					t:    col.ColumnType,
+					cfID: cf.Id,
+					cf:   col.Family,
+					ft:   &col.FieldType,
+					idx:  -1,
+				}
+				if _, ok := t.pkeyMap[col.ColumnMeta.Name]; ok {
+					colEntry.IsPrimary = true
+				}
+				cols = append(cols, colEntry)
+			}
+		}
+	}
+	return cols
+
+}
 func genRecordKey(tableID int64, pkdats []types.Datum, cf *model.ColumnFamilyMeta, column string) (kv.Key, error) {
 	var (
 		sc = &stmtctx.StatementContext{TimeZone: time.Local}
@@ -489,7 +551,6 @@ func (t *tableCommon) buildPrimaryKeyValues(lv *tspb.ListValue) ([]types.Datum, 
 		colType := pkey.ColumnType
 		colTypes = append(colTypes, colType)
 	}
-
 	delta := len(colTypes) - len(lv.GetValues())
 	if delta < 0 {
 		return nil, status.Errorf(codes.FailedPrecondition, "key values (%v) exceeds column types (%v) in build primary key", len(colTypes), len(lv.Values))
@@ -504,7 +565,7 @@ func (t *tableCommon) buildPrimaryKeyValues(lv *tspb.ListValue) ([]types.Datum, 
 func (t *tableCommon) buildPrimaryKeyFieldTypes() []*types.FieldType {
 	var ftypes = make([]*types.FieldType, 0)
 	for _, pkey := range t.pkeys {
-		ftypes = append(ftypes, pkey.FieldType)
+		ftypes = append(ftypes, &pkey.FieldType)
 	}
 	return ftypes
 }
@@ -532,6 +593,10 @@ func resolveColumn(column string) (string, string, error) {
 		return tokens[0], tokens[1], nil
 	}
 	return DefaultColumnFamily, tokens[0], nil
+}
+
+func IsFlexible(cf *model.ColumnFamilyMeta) bool {
+	return isFlexible(cf)
 }
 
 func isFlexible(cf *model.ColumnFamilyMeta) bool {

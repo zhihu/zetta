@@ -31,10 +31,12 @@
 package ddl
 
 import (
+	"strings"
+
 	"github.com/pingcap/errors"
+	parser_model "github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/sessionctx"
-	tspb "github.com/zhihu/zetta-proto/pkg/tablestore"
 	"github.com/zhihu/zetta/pkg/model"
 	"github.com/zhihu/zetta/tablestore/infoschema"
 )
@@ -101,13 +103,16 @@ func (d *ddl) indexValidate(ctx sessionctx.Context, db, table string, indexMeta 
 	return dbMeta.Id, tbMeta.Id, nil
 }
 
-func (d *ddl) CreateIndex(ctx sessionctx.Context, db, table string, indexMeta *model.IndexMeta) error {
+func (d *ddl) CreateIndex(ctx sessionctx.Context, db, table string, indexMeta *model.IndexMeta, ifNotExists bool) error {
 	var (
 		dbid int64
 		tbid int64
 		err  error
 	)
 	if dbid, tbid, err = d.indexValidate(ctx, db, table, indexMeta); err != nil {
+		if strings.Contains(err.Error(), "index already exist") && ifNotExists {
+			return nil
+		}
 		return errors.Trace(err)
 	}
 	job := &model.Job{
@@ -121,13 +126,14 @@ func (d *ddl) CreateIndex(ctx sessionctx.Context, db, table string, indexMeta *m
 	return errors.Trace(err)
 }
 
-func (d *ddl) AddColumn(ctx sessionctx.Context, req *tspb.AddColumnRequest) error {
+//func (d *ddl) AddColumn(ctx sessionctx.Context, req *tspb.AddColumnRequest) error {
+func (d *ddl) AddColumn(ctx sessionctx.Context, dbName, tblName string, cols []*model.ColumnMeta) error {
 	var (
 		dbid int64
 		tbid int64
 		err  error
 	)
-	if dbid, tbid, err = d.columnValidate(ctx, req); err != nil {
+	if dbid, tbid, err = d.columnValidate(ctx, dbName, tblName, cols); err != nil {
 		return errors.Trace(err)
 	}
 	job := &model.Job{
@@ -136,28 +142,28 @@ func (d *ddl) AddColumn(ctx sessionctx.Context, req *tspb.AddColumnRequest) erro
 		TableID:    tbid,
 		Type:       model.ActionAddColumn,
 		BinlogInfo: &model.HistoryInfo{},
-		Args:       []interface{}{req.Columns},
+		Args:       []interface{}{cols[0]},
 	}
 
 	return d.doDDLJob(ctx, job)
 }
 
-func (d *ddl) columnValidate(ctx sessionctx.Context, req *tspb.AddColumnRequest) (int64, int64, error) {
+func (d *ddl) columnValidate(ctx sessionctx.Context, dbName, tblName string, cols []*model.ColumnMeta) (int64, int64, error) {
 	var (
 		dbid int64
 		tbid int64
 		err  error
 	)
 	is := d.infoHandle.Get()
-	db, ok := is.GetDatabaseMetaByName(req.Database)
+	db, ok := is.GetDatabaseMetaByName(dbName)
 	if !ok {
 		return dbid, tbid, infoschema.ErrDatabaseNotExists.GenWithStackByArgs(db.Database)
 	}
-	tbMeta, err := is.GetTableMetaByName(req.Database, req.Table)
+	tbMeta, err := is.GetTableMetaByName(dbName, tblName)
 	if err != nil {
 		return dbid, tbid, infoschema.ErrTableNotExists.GenWithStackByArgs()
 	}
-	for _, c := range req.Columns {
+	for _, c := range cols {
 		if col := tbMeta.FindColumnByName(c.Name); col != nil {
 			return dbid, tbid, infoschema.ErrColumnExists.GenWithStackByArgs(c.Name)
 		}
@@ -174,10 +180,15 @@ func (d *ddl) tableValidate(ctx sessionctx.Context, tbMeta *model.TableMeta) (in
 	is := d.GetInfoSchemaWithInterceptor(ctx)
 	db, ok := is.GetDatabaseMetaByName(tbMeta.Database)
 	if !ok {
-		return dbid, tbid, infoschema.ErrDatabaseNotExists.GenWithStackByArgs(db.Database)
+		var database = "unknown database"
+		if db != nil {
+			database = db.Database
+		}
+		return dbid, tbid, infoschema.ErrDatabaseNotExists.GenWithStackByArgs(database)
 	}
+
 	if is.TableExists(tbMeta.Database, tbMeta.TableName) {
-		return dbid, tbid, infoschema.ErrTableExists.GenWithStackByArgs()
+		return dbid, tbid, infoschema.ErrTableExists.GenWithStackByArgs(tbMeta.TableName)
 	}
 
 	tbMeta, err = buildTableInfoWithCheck(ctx, d, db, tbMeta)
@@ -188,16 +199,23 @@ func (d *ddl) tableValidate(ctx sessionctx.Context, tbMeta *model.TableMeta) (in
 	return db.Id, tbMeta.Id, err
 }
 
-func (d *ddl) CreateTable(ctx sessionctx.Context, tbMeta *model.TableMeta) error {
+func (d *ddl) CreateTable(ctx sessionctx.Context, tbMeta *model.TableMeta, ifExists bool) error {
 	var (
 		dbid int64
 		tbid int64
 		err  error
 	)
+
+	is := d.GetInfoSchemaWithInterceptor(ctx)
+	if is.TableExists(tbMeta.Database, tbMeta.TableName) && ifExists {
+		return nil
+	}
+
 	if dbid, tbid, err = d.tableValidate(ctx, tbMeta); err != nil {
 		return errors.Trace(err)
 	}
-	tbMeta.State = model.StateNone
+
+	tbMeta.State = parser_model.StateNone
 	job := &model.Job{
 		SchemaID:   dbid,
 		TableID:    tbid,
@@ -210,6 +228,28 @@ func (d *ddl) CreateTable(ctx sessionctx.Context, tbMeta *model.TableMeta) error
 	return errors.Trace(err)
 }
 
+func (d *ddl) DropTable(ctx sessionctx.Context, db, table string, ifExists bool) error {
+	is := d.GetInfoSchemaWithInterceptor(ctx)
+	if !is.TableExists(db, table) {
+		if ifExists {
+			return nil
+		}
+		return infoschema.ErrTableDropExists.GenWithStackByArgs()
+	}
+	dbMeta, _ := is.GetDatabaseMetaByName(db)
+	tbMeta, _ := is.GetTableMetaByName(db, table)
+	job := &model.Job{
+		SchemaID:   dbMeta.Id,
+		TableID:    tbMeta.Id,
+		Type:       model.ActionDropTable,
+		BinlogInfo: &model.HistoryInfo{},
+	}
+
+	err := d.doDDLJob(ctx, job)
+	return errors.Trace(err)
+}
+
+/*
 func (d *ddl) DropTable(ctx sessionctx.Context, db, table string) error {
 	is := d.GetInfoSchemaWithInterceptor(ctx)
 	if !is.TableExists(db, table) {
@@ -227,3 +267,4 @@ func (d *ddl) DropTable(ctx sessionctx.Context, db, table string) error {
 	err := d.doDDLJob(ctx, job)
 	return errors.Trace(err)
 }
+*/

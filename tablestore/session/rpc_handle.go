@@ -29,6 +29,7 @@ import (
 	"github.com/zhihu/zetta/tablestore/domain"
 	"github.com/zhihu/zetta/tablestore/rpc"
 	sctx "github.com/zhihu/zetta/tablestore/sessionctx"
+	"github.com/zhihu/zetta/tablestore/table"
 
 	"github.com/zhihu/zetta/tablestore/table/tables"
 )
@@ -38,7 +39,9 @@ func (s *session) HandleRead(ctx context.Context, req rpc.ReadRequest, txn kv.Tr
 		ri  RecordSet
 		err error
 	)
-
+	if err := s.FetchTxn(txn.(*TxnState), true); err != nil {
+		return nil, err
+	}
 	ztable, err := s.prepareZettaTable(ctx, req.GetTable())
 	if err != nil {
 		return nil, err
@@ -50,6 +53,10 @@ func (s *session) HandleRead(ctx context.Context, req rpc.ReadRequest, txn kv.Tr
 		ri, err = ztable.ReadStore(ctx, req.(*tspb.ReadRequest))
 	case *tspb.SparseReadRequest:
 		ri, err = ztable.ReadSparse(ctx, req.(*tspb.SparseReadRequest))
+	case *tspb.SparseScanRequest:
+		ri, err = ztable.SparseScan(ctx, req.(*tspb.SparseScanRequest))
+	case *table.ScanRequest:
+		ri, err = ztable.ScanStore(ctx, req.(*table.ScanRequest))
 	default:
 		return nil, status.Error(codes.FailedPrecondition, "not expect read request")
 	}
@@ -62,80 +69,152 @@ func (s *session) HandleRead(ctx context.Context, req rpc.ReadRequest, txn kv.Tr
 }
 
 func (s *session) HandleMutate(ctx context.Context, req rpc.MutationRequest, txn kv.Transaction) (rpc.Response, error) {
-	tx := txn.(*TxnState)
-	if tx.ReadOnly {
+	var (
+		tx  = txn.(*TxnState)
+		err error
+	)
+	if tx.TxnOpt.ReadOnly {
 		return nil, status.Errorf(codes.Aborted, "session:%s tx:%s read only", s.name, tx.ID)
 	}
-	ctx = sctx.SetTxnCtx(ctx, tx)
-	for _, m := range req.GetMutations() {
-		switch op := m.Operation.(type) {
-		default:
-			return nil, fmt.Errorf("unsupported mutation operation type %T", op)
-		case *tspb.Mutation_Insert:
-			insert := op.Insert
-			ztable, err := s.prepareZettaTable(ctx, insert.Table)
-			if err != nil {
-				return nil, err
-			}
-			if err := ztable.Insert(ctx, insert.KeySet, insert.Family, insert.Columns, insert.Values); err != nil {
-				logutil.Logger(ctx).Error("mutation insert error", zap.Error(err))
-				return nil, err
-			}
-		case *tspb.Mutation_Delete_:
-			del := op.Delete
-			ztable, err := s.prepareZettaTable(ctx, del.Table)
-
-			if err != nil {
-				return nil, err
-			}
-			if err := ztable.Delete(ctx, del.GetKeySet(), del.Family, del.Columns); err != nil {
-				logutil.Logger(ctx).Error("mutation delete error", zap.Error(err))
-				return nil, err
-			}
-		case *tspb.Mutation_InsertOrUpdate:
-			iou := op.InsertOrUpdate
-			ztable, err := s.prepareZettaTable(ctx, iou.Table)
-			if err != nil {
-				return nil, err
-			}
-
-			if err := ztable.InsertOrUpdate(ctx, iou.KeySet, iou.Family, iou.Columns, iou.Values); err != nil {
-				logutil.Logger(ctx).Error("mutation insert-or-update error", zap.Error(err))
-				return nil, err
-			}
-
-		case *tspb.Mutation_Update:
-			up := op.Update
-			ztable, err := s.prepareZettaTable(ctx, up.Table)
-			if err != nil {
-				return nil, err
-			}
-			if err := ztable.Update(ctx, up.KeySet, up.Family, up.Columns, up.Values); err != nil {
-				logutil.Logger(ctx).Error("mutation update error", zap.Error(err))
-				return nil, err
-			}
-		case *tspb.Mutation_Replace:
-			replace := op.Replace
-
-			ztable, err := s.prepareZettaTable(ctx, replace.Table)
-			if err != nil {
-				return nil, err
-			}
-			if err := ztable.Replace(ctx, replace.KeySet, replace.Family, replace.Columns, replace.Values); err != nil {
-				logutil.Logger(ctx).Error("mutation replace error", zap.Error(err))
-				return nil, err
-			}
-		}
+	if err := s.FetchTxn(txn.(*TxnState), true); err != nil {
+		return nil, err
+	}
+	nctx := sctx.SetTxnCtx(ctx, tx)
+	if err = s.dispatchMutation(nctx, req, tx); err != nil {
+		return &rpc.CommitTimeResp{CommitTs: time.Time{}}, err
+	}
+	ct, err := s.doMutationCommit(nctx, req, tx)
+	if err == nil {
+		return &rpc.CommitTimeResp{CommitTs: ct}, nil
 	}
 
-	ct, err := s.doMutationCommit(ctx, req, tx)
 	if err != nil {
-		logutil.Logger(ctx).Error("txn commit error", zap.Error(err))
-		return nil, status.Errorf(codes.Aborted, "transaction commit error %v", err)
+		if !kv.IsTxnRetryableError(err) {
+			logutil.Logger(ctx).Error("txn commit error", zap.Error(err))
+			return nil, status.Errorf(codes.Aborted, "transaction commit error %v", err)
+		}
+		return s.retry(ctx, req, 5)
 	}
 
 	return &rpc.CommitTimeResp{CommitTs: ct}, nil
 
+}
+
+func (s *session) retry(ctx context.Context, req rpc.MutationRequest, maxCnt int) (rpc.Response, error) {
+	var retryCnt uint
+
+	for {
+		tx, err := s.buildRetryTxn(ctx)
+		if err != nil {
+			logutil.Logger(ctx).Error("build retry txn error", zap.Error(err))
+		}
+		nctx := sctx.SetTxnCtx(ctx, tx)
+		if err = s.dispatchMutation(nctx, req, tx); err != nil {
+			return &rpc.CommitTimeResp{CommitTs: time.Time{}}, err
+		}
+
+		ct, err := s.doMutationCommit(nctx, req, tx)
+		if err == nil {
+			return &rpc.CommitTimeResp{CommitTs: ct}, err
+		}
+		if !kv.IsTxnRetryableError(err) {
+			logutil.Logger(ctx).Error("txn commit error", zap.Error(err))
+			return nil, status.Errorf(codes.Aborted, "transaction commit error %v", err)
+		}
+
+		retryCnt++
+		if maxCnt != -1 && int(retryCnt) >= maxCnt {
+			return &rpc.CommitTimeResp{CommitTs: time.Time{}}, err
+		}
+		kv.BackOff(retryCnt)
+	}
+}
+
+func (s *session) buildRetryTxn(ctx context.Context) (*TxnState, error) {
+	opt := TxnStateOption{Single: false, ReadOnly: false, isRawKV: false}
+	tx, err := s.createTxn(ctx, opt)
+	if err != nil {
+		return nil, err
+	}
+	s.PrepareTSFuture(ctx, tx.(*TxnState))
+	s.PrepareTxnCtx(ctx, tx.(*TxnState))
+	if err := s.FetchTxn(tx.(*TxnState), true); err != nil {
+		return nil, err
+	}
+	return tx.(*TxnState), nil
+}
+
+func (s *session) dispatchMutation(ctx context.Context, req rpc.MutationRequest, tx *TxnState) error {
+	var (
+		err    error
+		ztable *tables.Table
+	)
+	for _, m := range req.GetMutations() {
+		switch op := m.Operation.(type) {
+		default:
+			return fmt.Errorf("unsupported mutation operation type %T", op)
+		case *tspb.Mutation_Insert:
+			insert := op.Insert
+			ztable, err = s.prepareZettaTable(ctx, insert.Table)
+			if err != nil {
+				break
+			}
+			if err = ztable.Insert(ctx, insert.KeySet, insert.Family, insert.Columns, insert.Values); err != nil {
+				logutil.Logger(ctx).Error("mutation insert error", zap.Error(err))
+				break
+			}
+		case *tspb.Mutation_Delete_:
+			del := op.Delete
+			ztable, err = s.prepareZettaTable(ctx, del.Table)
+			if err != nil {
+				break
+			}
+			if err := ztable.Delete(ctx, del.GetKeySet(), del.Family, del.Columns); err != nil {
+				logutil.Logger(ctx).Error("mutation delete error", zap.Error(err))
+				break
+			}
+		case *tspb.Mutation_InsertOrUpdate:
+			iou := op.InsertOrUpdate
+			ztable, err = s.prepareZettaTable(ctx, iou.Table)
+			if err != nil {
+				break
+			}
+			if err = ztable.InsertOrUpdate(ctx, iou.KeySet, iou.Family, iou.Columns, iou.Values); err != nil {
+				logutil.Logger(ctx).Error("mutation insert-or-update error", zap.Error(err))
+				break
+			}
+
+		case *tspb.Mutation_Update:
+			up := op.Update
+			ztable, err = s.prepareZettaTable(ctx, up.Table)
+			if err != nil {
+				break
+			}
+			if err = ztable.Update(ctx, up.KeySet, up.Family, up.Columns, up.Values); err != nil {
+				logutil.Logger(ctx).Error("mutation update error", zap.Error(err))
+				return err
+			}
+		case *tspb.Mutation_Replace:
+			replace := op.Replace
+
+			ztable, err = s.prepareZettaTable(ctx, replace.Table)
+			if err != nil {
+				break
+			}
+			if err = ztable.Replace(ctx, replace.KeySet, replace.Family, replace.Columns, replace.Values); err != nil {
+				logutil.Logger(ctx).Error("mutation replace error", zap.Error(err))
+				break
+			}
+		}
+	}
+	if err != nil {
+		if er := tx.Rollback(); er != nil {
+			logutil.BgLogger().Error("rollback error", zap.Error(er))
+		}
+		s.dropTxn(tx.ID)
+		return err
+	}
+	return nil
 }
 
 func (s *session) prefetchTable(ctx context.Context, tableDict map[string]*tables.Table, table string, txn kv.Transaction) (*tables.Table, error) {
@@ -173,7 +252,12 @@ func (s *session) prepareZettaTable(ctx context.Context, table string) (*tables.
 		return nil, err
 	}
 	// tt.SetTxn(txn)
-	ztable := tt.(*tables.Table)
+	ztable, ok := tt.(*tables.Table)
+	if !ok {
+		err = fmt.Errorf("invalid table type (%T): %#v", tt, tt)
+		logutil.Logger(ctx).Error(err.Error())
+		return nil, err
+	}
 	return ztable, nil
 }
 
@@ -186,32 +270,45 @@ func (s *session) doMutationCommit(ctx context.Context, req rpc.MutationRequest,
 		}
 	}
 	defer tx.cleanup()
-	err := kv.WalkMemBuffer(tx.buf, func(k kv.Key, v []byte) error {
-		if len(v) == 0 {
-			return tx.Transaction.Delete(k)
-		}
-		return tx.Transaction.Set(k, v)
-	})
-
-	if err != nil {
-		tx.doNotCommit = err
+	if ctx.Err() != nil {
+		logutil.BgLogger().Error("context error", zap.Error(ctx.Err()))
+		return time.Time{}, nil
 	}
-	err = tx.Commit(ctx)
+	if !txn.Valid() {
+		logutil.BgLogger().Error("txn invalid")
+		return time.Time{}, nil
+	}
+	if _, err := tx.Flush(); err != nil {
+		return time.Time{}, err
+	}
+
+	err := tx.Commit(ctx)
 	if err != nil {
-		logutil.Logger(ctx).Error("commit error", zap.Error(err))
-		if er := tx.Rollback(); er != nil {
-			logutil.Logger(ctx).Error("rollback error", zap.Error(er))
+		flag := kv.IsTxnRetryableError(err)
+		logutil.BgLogger().Error(fmt.Sprintf("tx commit error %+v", tx), zap.Error(err), zap.Bool("retryable", flag))
+		if tx.Valid() {
+			if er := tx.Rollback(); er != nil {
+				logutil.BgLogger().Error("rollback error", zap.Error(er))
+			}
 		}
 		return time.Time{}, err
 	}
+	s.dropTxn(tx.ID)
 	return time.Now(), nil
 }
 
-func (s *session) readTx(ctx context.Context, tsel *tspb.TransactionSelector, committable bool) (tx *TxnState, err error) {
+func (s *session) readTx(ctx context.Context, tsel *tspb.TransactionSelector, rtopt *RetrieveTxnOpt) (tx *TxnState, err error) {
 
 	singleUse := func(readOnly bool) (*TxnState, error) {
-		tx, err := s.CreateTxn(ctx, true, readOnly)
-		return tx.(*TxnState), err
+		opt := TxnStateOption{Single: true, ReadOnly: readOnly, isRawKV: rtopt.IsRawKV}
+		tx, err := s.createTxn(ctx, opt)
+		txs := tx.(*TxnState)
+		if txs.TxnOpt.isRawKV {
+			s.PrepareRawkvTxn(ctx, txs)
+		} else {
+			s.PrepareTSFuture(ctx, txs)
+		}
+		return txs, err
 	}
 
 	singleUseReadOnly := func() (*TxnState, error) {
@@ -219,7 +316,8 @@ func (s *session) readTx(ctx context.Context, tsel *tspb.TransactionSelector, co
 	}
 
 	beginReadWrite := func(readOnly bool) (*TxnState, error) {
-		tx, err := s.CreateTxn(ctx, false, readOnly)
+		opt := TxnStateOption{Single: false, ReadOnly: readOnly, isRawKV: rtopt.IsRawKV}
+		tx, err := s.createTxn(ctx, opt)
 		if err != nil {
 			return nil, err
 		}
@@ -254,10 +352,20 @@ func (s *session) readTx(ctx context.Context, tsel *tspb.TransactionSelector, co
 		}
 	case *tspb.TransactionSelector_Id:
 		txnid := sel.Id
-		pop := committable
+		pop := rtopt.Committable
 		tx, err := s.searchTxn(string(txnid), pop)
 		if err != nil {
 			return nil, err
+		}
+
+		if rtopt != nil {
+			return nil, status.Error(codes.Aborted, "retrieve transaction option should be specific")
+		}
+		if !rtopt.IsRawKV {
+			s.PrepareTSFuture(ctx, tx)
+			s.PrepareTxnCtx(ctx, tx)
+		} else {
+			s.PrepareRawkvTxn(ctx, tx)
 		}
 		return tx, nil
 	}
@@ -274,4 +382,19 @@ func (s *session) searchTxn(tid string, pop bool) (*TxnState, error) {
 		return txn, nil
 	}
 	return nil, status.Errorf(codes.NotFound, "no such transaction %v in session %v", tid, s.name)
+}
+
+func (s *session) RawkvAccess(ctx context.Context, table string) (bool, error) {
+	ztable, err := s.prepareZettaTable(ctx, table)
+	if err != nil {
+		return false, err
+	}
+	accessMode, ok := ztable.Meta().Attributes["AccessMode"]
+	if !ok {
+		return false, nil
+	}
+	if accessMode == "rawkv" {
+		return true, nil
+	}
+	return false, nil
 }

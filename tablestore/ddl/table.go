@@ -27,18 +27,23 @@
 package ddl
 
 import (
+	"encoding/hex"
+	//"encoding/json"
 	"fmt"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
+	parser_model "github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/tablecodec"
+	"github.com/pingcap/tidb/util/codec"
 	"github.com/zhihu/zetta/pkg/meta"
 	"github.com/zhihu/zetta/pkg/model"
+	"github.com/zhihu/zetta/pkg/tablecodec"
 	"github.com/zhihu/zetta/tablestore/infoschema"
 	"github.com/zhihu/zetta/tablestore/table"
 	"github.com/zhihu/zetta/tablestore/table/tables"
+	"github.com/zhihu/zetta/tablestore/util/pdhttp"
 )
 
 func onCreateTable(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, _ error) {
@@ -56,7 +61,11 @@ func onCreateTable(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, _ error)
 		return ver, errors.Trace(err)
 	}
 
-	tbInfo.State = model.StateNone
+	if tbInfo.Id == 0 {
+		return ver, errors.New("table id must not be zero")
+	}
+
+	tbInfo.State = parser_model.StateNone
 	err := checkTableNotExists(d, t, schemaID, tbInfo.TableName)
 	if err != nil {
 		if infoschema.ErrDatabaseNotExists.Equal(err) || infoschema.ErrTableExists.Equal(err) {
@@ -69,12 +78,24 @@ func onCreateTable(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, _ error)
 	if err != nil {
 		return ver, errors.Trace(err)
 	}
-
 	switch tbInfo.State {
-	case model.StateNone:
+	case parser_model.StateNone:
 		// none -> public
-		tbInfo.State = model.StatePublic
+		tbInfo.State = parser_model.StatePublic
 		tbInfo.UpdateTS = t.StartTS
+		if len(tbInfo.Rules) != 0 {
+			tblPrefix := tablecodec.EncodeTablePrefix(tbInfo.Id)
+			tbInfo.Rules[0].StartKey = codec.EncodeBytes(nil, tblPrefix)
+			tbInfo.Rules[0].StartKeyHex = hex.EncodeToString(tbInfo.Rules[0].StartKey)
+			tbInfo.Rules[0].EndKey = codec.EncodeBytes(nil, tblPrefix.PrefixNext())
+			tbInfo.Rules[0].EndKeyHex = hex.EncodeToString(tbInfo.Rules[0].EndKey)
+			tbInfo.Rules[0].LocationLabels = append(tbInfo.Rules[0].LocationLabels, "host")
+			tbInfo.Rules[0].Index = int(tbInfo.Id)
+			err = pdhttp.PutPlacementRules(tbInfo.Rules)
+			if err != nil {
+				return ver, err
+			}
+		}
 		err = createTableOrViewWithCheck(t, job, schemaID, tbInfo)
 		if err != nil {
 			return ver, errors.Trace(err)
@@ -89,6 +110,7 @@ func onCreateTable(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, _ error)
 }
 
 func onDropTableOrView(t *meta.Meta, job *model.Job) (ver int64, _ error) {
+	fmt.Println("on drop table")
 	tblInfo, err := checkTableExistAndCancelNonExistJob(t, job, job.SchemaID)
 	if err != nil {
 		return ver, errors.Trace(err)
@@ -96,24 +118,32 @@ func onDropTableOrView(t *meta.Meta, job *model.Job) (ver int64, _ error) {
 
 	originalState := job.SchemaState
 	switch tblInfo.State {
-	case model.StatePublic:
+	case parser_model.StatePublic:
 		// public -> write only
 		job.SchemaState = model.StateWriteOnly
-		tblInfo.State = model.StateWriteOnly
-		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != tblInfo.State)
-	case model.StateWriteOnly:
+		tblInfo.State = parser_model.StateWriteOnly
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != model.StateWriteOnly)
+	case parser_model.StateWriteOnly:
 		// write only -> delete only
 		job.SchemaState = model.StateDeleteOnly
-		tblInfo.State = model.StateDeleteOnly
-		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != tblInfo.State)
-	case model.StateDeleteOnly:
-		tblInfo.State = model.StateNone
-		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != tblInfo.State)
+		tblInfo.State = parser_model.StateDeleteOnly
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != model.StateDeleteOnly)
+	case parser_model.StateDeleteOnly:
+		tblInfo.State = parser_model.StateNone
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != model.StateNone)
 		if err != nil {
 			return ver, errors.Trace(err)
 		}
 		if err = t.DropTableOrView(job.SchemaID, job.TableID, true); err != nil {
 			break
+		}
+		if len(tblInfo.Rules) != 0 {
+			tblInfo.Rules[0].Count = 0
+			fmt.Println("delete placement rules")
+			if err = pdhttp.PutPlacementRules(tblInfo.Rules); err != nil {
+				fmt.Println("delete placement rules err:", err)
+				break
+			}
 		}
 		// Finish this job.
 		job.FinishTableJob(model.JobStateDone, model.StateNone, ver, tblInfo)
@@ -127,12 +157,20 @@ func onDropTableOrView(t *meta.Meta, job *model.Job) (ver int64, _ error) {
 }
 
 func createTableOrViewWithCheck(t *meta.Meta, job *model.Job, schemaID int64, tbInfo *model.TableMeta) error {
-	err := checkTableInfoValid(tbInfo)
+	//err := checkTableInfoValid(tbInfo)
+	err := completeTableInfo(tbInfo)
 	if err != nil {
 		job.State = model.JobStateCancelled
 		return errors.Trace(err)
 	}
 	return t.CreateTableOrView(schemaID, tbInfo)
+}
+
+func completeTableInfo(tbMeta *model.TableMeta) error {
+	for i := range tbMeta.Indices {
+		tbMeta.Indices[i].Id = allocateIndexID(tbMeta)
+	}
+	return nil
 }
 
 func checkTableInfoValid(tbMeta *model.TableMeta) error {
@@ -183,6 +221,7 @@ func checkTableNotExistsFromStore(t *meta.Meta, schemaID int64, tableName string
 	for _, tbl := range tables {
 		if tbl.TableName == tableName {
 			return infoschema.ErrTableExists.GenWithStackByArgs(tbl.TableName)
+			//return nil
 		}
 	}
 
@@ -195,7 +234,7 @@ func getTableInfoAndCancelFaultJob(t *meta.Meta, job *model.Job, schemaID int64)
 		return nil, errors.Trace(err)
 	}
 
-	if tblInfo.State != model.StatePublic {
+	if tblInfo.State != parser_model.StatePublic {
 		job.State = model.JobStateCancelled
 		return nil, ErrInvalidTableState.GenWithStack("table %s is not in public, but %s", tblInfo.TableName, tblInfo.State)
 	}
@@ -238,7 +277,7 @@ func updateVersionAndTableInfo(t *meta.Meta, job *model.Job, tblInfo *model.Tabl
 		}
 	}
 
-	if tblInfo.State == model.StatePublic {
+	if tblInfo.State == parser_model.StatePublic {
 		tblInfo.UpdateTS = t.StartTS
 	}
 	return ver, t.UpdateTable(job.SchemaID, tblInfo)
@@ -253,10 +292,10 @@ func buildTableInfoWithCheck(ctx sessionctx.Context, ddl *ddl, db *model.Databas
 		}
 		tb.Id = tableID[0]
 	}
-	for i, _ := range tb.Columns {
+	for i := range tb.Columns {
 		tb.Columns[i].Id = allocateColumnID(tb)
 	}
-	for i, _ := range tb.ColumnFamilies {
+	for i := range tb.ColumnFamilies {
 		tb.ColumnFamilies[i].Id = allocateColumnFamilyID(tb)
 	}
 	tb.ColumnFamilies = append(tb.ColumnFamilies, model.DefaultColumnFamilyMeta())
@@ -264,6 +303,11 @@ func buildTableInfoWithCheck(ctx sessionctx.Context, ddl *ddl, db *model.Databas
 }
 
 func addColumn(tbInfo *model.TableMeta, col *model.ColumnMeta) {
+	for _, c := range tbInfo.Columns {
+		if col.Name == c.Name {
+			return
+		}
+	}
 	col.Id = allocateColumnID(tbInfo)
 	tbInfo.Columns = append(tbInfo.Columns, col)
 }
