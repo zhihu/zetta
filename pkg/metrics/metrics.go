@@ -62,7 +62,6 @@ func RetLabel(err error) string {
 // RegisterMetrics registers the metrics which are ONLY used in TiDB server.
 func RegisterMetrics() {
 
-	prometheus.MustRegister(metrics.TiKVBackoffCounter)
 	prometheus.MustRegister(metrics.TiKVBackoffHistogram)
 	prometheus.MustRegister(metrics.TiKVCoprocessorHistogram)
 	prometheus.MustRegister(metrics.TiKVLoadSafepointCounter)
@@ -73,20 +72,23 @@ func RegisterMetrics() {
 	prometheus.MustRegister(metrics.TiKVRegionErrorCounter)
 	prometheus.MustRegister(metrics.TiKVSecondaryLockCleanupFailureCounter)
 	prometheus.MustRegister(metrics.TiKVSendReqHistogram)
-	prometheus.MustRegister(metrics.TiKVSnapshotCounter)
-	prometheus.MustRegister(metrics.TiKVTxnCmdCounter)
 	prometheus.MustRegister(metrics.TiKVTxnCmdHistogram)
-	prometheus.MustRegister(metrics.TiKVTxnCounter)
 	prometheus.MustRegister(metrics.TiKVTxnRegionsNumHistogram)
 	prometheus.MustRegister(metrics.TiKVTxnWriteKVCountHistogram)
 	prometheus.MustRegister(metrics.TiKVTxnWriteSizeHistogram)
 	prometheus.MustRegister(metrics.TiKVLocalLatchWaitTimeHistogram)
 	prometheus.MustRegister(metrics.TiKVPendingBatchRequests)
+	prometheus.MustRegister(metrics.TiKVStatusDuration)
+	prometheus.MustRegister(metrics.TiKVStatusCounter)
 	prometheus.MustRegister(metrics.TiKVBatchWaitDuration)
 	prometheus.MustRegister(metrics.TiKVBatchClientUnavailable)
 	prometheus.MustRegister(metrics.TiKVRangeTaskStats)
 	prometheus.MustRegister(metrics.TiKVRangeTaskPushDuration)
+	prometheus.MustRegister(metrics.TiKVTokenWaitDuration)
 	prometheus.MustRegister(metrics.TiKVTxnHeartBeatHistogram)
+	prometheus.MustRegister(metrics.TiKVPessimisticLockKeysDuration)
+	prometheus.MustRegister(metrics.TiKVTTLLifeTimeReachCounter)
+	prometheus.MustRegister(metrics.TiKVNoAvailableConnectionCounter)
 
 	prometheus.MustRegister(TSFutureWaitDuration)
 

@@ -38,6 +38,7 @@ import (
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/types"
 	"github.com/zhihu/zetta/pkg/model"
+	"github.com/zhihu/zetta/tablestore/mysql/sctx"
 
 	tspb "github.com/zhihu/zetta-proto/pkg/tablestore"
 )
@@ -102,11 +103,13 @@ var (
 
 	errDefaultValue = terror.ClassExpression.New(mysql.ErrInvalidDefault, "invalid default value")
 
-	ErrUserLimitReached = terror.ClassTable.New(codeUserLimitReached, "result limit reached")
+	ErrResultSetUserLimitReached = terror.ClassTable.New(codeUserLimitReached, "result limit reached")
+
+	ErrResultSetClosed = terror.ClassTable.New(mysql.ErrErrorOnClose, "result set closed")
 )
 
 // RecordIterFunc is used for low-level record iteration.
-type RecordIterFunc func(h int64, rec []types.Datum, cols []*Column) (more bool, err error)
+type RecordIterFunc func(rec []types.Datum, cols []*Column) (more bool, err error)
 
 // AddRecordOpt contains the options will be used when adding a record.
 type AddRecordOpt struct {
@@ -116,8 +119,15 @@ type AddRecordOpt struct {
 
 // Table is used to retrieve and modify rows in table.
 type Table interface {
-	// // IterRecords iterates records in the table and calls fn.
-	// IterRecords(ctx sessionctx.Context, startKey kv.Key, cols []*Column, fn RecordIterFunc) error
+	// IterRecords iterates records in the table and calls fn.
+	IterRecords(ctx sctx.Context, startKey, endKey kv.Key, cols []*Column, reverse bool, fn RecordIterFunc) error
+	FetchRecordsByIndex(ctx sctx.Context, idxVals []types.Datum, cols []*Column, idxID int64, uniq bool, fn RecordIterFunc) error
+	Scan(ctx sctx.Context, idxVals []types.Datum, idxMeta *model.IndexMeta, isPrimay bool, lower, upper []byte,
+		cols []*Column, fn RecordIterFunc, limit int64) error
+	BatchGet(ctx sctx.Context, idxVals [][]types.Datum, cols []*Column, idxID int64, primary bool, fn RecordIterFunc) error
+	AddRecord(ctx sctx.Context, row []types.Datum) error
+	UpdateRecord(ctx sctx.Context, row []types.Datum, vals map[int64]types.Datum) error
+	RemoveRecord(ctx sctx.Context, row []types.Datum) error
 
 	// RowWithCols returns a row that contains the given cols.
 	// RowWithCols(ctx sessionctx.Context, h int64, cols []*Column) ([]types.Datum, error)
@@ -126,8 +136,8 @@ type Table interface {
 	// Row(ctx sessionctx.Context, h int64) ([]types.Datum, error)
 
 	// Cols returns the columns of the table which is used in select.
-	// Cols() []*Column
-
+	Cols() []*Column
+	ColumnFamilies() []*model.ColumnFamilyMeta
 	// Indices returns the indices of the table.
 	// Indices() []Index
 
@@ -183,16 +193,25 @@ const (
 	codeUserLimitReached = mysql.ErrUserLimitReached
 )
 
-func init() {
-	tableMySQLErrCodes := map[terror.ErrCode]uint16{
-		codeColumnCantNull:           mysql.ErrBadNull,
-		codeUnknownColumn:            mysql.ErrBadField,
-		codeDuplicateColumn:          mysql.ErrFieldSpecifiedTwice,
-		codeNoDefaultValue:           mysql.ErrNoDefaultForField,
-		codeTruncateWrongValue:       mysql.ErrTruncatedWrongValueForField,
-		codeUnknownPartition:         mysql.ErrUnknownPartition,
-		codeNoPartitionForGivenValue: mysql.ErrNoPartitionForGivenValue,
-		codeUserLimitReached:         mysql.ErrUserLimitReached,
-	}
-	terror.ErrClassToMySQLCodes[terror.ClassTable] = tableMySQLErrCodes
+type ScanRequest struct {
+	Table        string
+	StartRow     []byte
+	StopRow      []byte
+	Timestamp    int64
+	Columns      [][]byte
+	Caching      int32
+	FilterString []byte
+	BatchSize    int32
+	SortColumns  bool
+	Reversed     bool
+	ColFamilyMap map[string]struct{}
+	QualifierMap map[string]string
+}
+
+func (s *ScanRequest) GetSession() string {
+	return ""
+}
+
+func (s *ScanRequest) GetTable() string {
+	return s.Table
 }

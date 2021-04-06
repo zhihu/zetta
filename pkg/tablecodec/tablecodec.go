@@ -167,6 +167,18 @@ func ExtractEncodedHighColumnName(key []byte, sc *stmtctx.StatementContext, tabl
 	return string(b[len(body):]), nil
 }
 
+func EncodeRecordKeyWideWithEncodedPK(tableID int64,
+	encodedPK []byte, columnFamilyID int64) []byte {
+	//TODO: The preallocated length of b can be more accurate.
+	b := make([]byte, 0, idLen+1+len(encodedPK)+1+idLen)
+	b = codec.EncodeInt(b, tableID)
+	b = append(b, primaryKeyPrefix...)
+	b = append(b, encodedPK...)
+	b = append(b, columnFamilyPrefix...)
+	b = codec.EncodeInt(b, columnFamilyID)
+	return b
+}
+
 // Format: v(TableID),v(PrimaryKeyPrefix),m(PrimaryKey),v(ColumnFamilyPrefix),v(ColumnFamilyID)
 func EncodeRecordKeyWide(sc *stmtctx.StatementContext, tableID int64,
 	primaryKey []types.Datum, columnFamilyID int64) ([]byte, error) {
@@ -239,6 +251,16 @@ func EncodeIndex(sc *stmtctx.StatementContext, tableID, idxID int64,
 	if err != nil {
 		return b, errors.Trace(err)
 	}
+	return b, nil
+}
+
+func EncodeIndexPrefix(sc *stmtctx.StatementContext, tableID, idxID int64,
+	values []types.Datum) ([]byte, error) {
+	b, err := EncodeIndexUnique(sc, tableID, idxID, values)
+	if err != nil {
+		return b, errors.Trace(err)
+	}
+	b = append(b, primaryKeyPrefix...)
 	return b, nil
 }
 
@@ -393,9 +415,7 @@ func unflatten(datum types.Datum, ft *types.FieldType, loc *time.Location) (type
 		mysql.TypeString:
 		return datum, nil
 	case mysql.TypeDate, mysql.TypeDatetime, mysql.TypeTimestamp:
-		var t types.Time
-		t.Type = ft.Tp
-		t.Fsp = ft.Decimal
+		t := types.NewTime(types.ZeroCoreTime, ft.Tp, int8(ft.Decimal))
 		var err error
 		err = t.FromPackedUint(datum.GetUint64())
 		if err != nil {
@@ -411,8 +431,8 @@ func unflatten(datum types.Datum, ft *types.FieldType, loc *time.Location) (type
 		datum.SetMysqlTime(t)
 		return datum, nil
 	case mysql.TypeDuration: //duration should read fsp from column meta data
-		dur := types.Duration{Duration: time.Duration(datum.GetInt64()), Fsp: ft.Decimal}
-		datum.SetValue(dur)
+		dur := types.Duration{Duration: time.Duration(datum.GetInt64()), Fsp: int8(ft.Decimal)}
+		datum.SetMysqlDuration(dur)
 		return datum, nil
 	case mysql.TypeEnum:
 		// ignore error deliberately, to read empty enum value.
@@ -420,14 +440,14 @@ func unflatten(datum types.Datum, ft *types.FieldType, loc *time.Location) (type
 		if err != nil {
 			enum = types.Enum{}
 		}
-		datum.SetValue(enum)
+		datum.SetMysqlEnum(enum, ft.Collate)
 		return datum, nil
 	case mysql.TypeSet:
 		set, err := types.ParseSetValue(ft.Elems, datum.GetUint64())
 		if err != nil {
 			return datum, errors.Trace(err)
 		}
-		datum.SetValue(set)
+		datum.SetMysqlSet(set, ft.Collate)
 		return datum, nil
 	case mysql.TypeBit:
 		val := datum.GetUint64()
@@ -551,7 +571,7 @@ func flatten(sc *stmtctx.StatementContext, data types.Datum, ret *types.Datum) e
 	case types.KindMysqlTime:
 		// for mysql datetime, timestamp and date type
 		t := data.GetMysqlTime()
-		if t.Type == mysql.TypeTimestamp && sc.TimeZone != time.UTC {
+		if t.Type() == mysql.TypeTimestamp && sc.TimeZone != time.UTC {
 			err := t.ConvertTimeZone(sc.TimeZone, time.UTC)
 			if err != nil {
 				return errors.Trace(err)
@@ -649,7 +669,7 @@ func EncodeTablePrefix(tableID int64) kv.Key {
 // EncodeTableIndexPrefix encodes index prefix with tableID and idxID.
 func EncodeTableIndexPrefix(tableID, idxID int64) kv.Key {
 	key := make([]byte, 0, prefixLen)
-	key = append(key, tablePrefix...)
+	//key = append(key, tablePrefix...)
 	key = appendTableIndexPrefix(key, tableID)
 	key = codec.EncodeInt(key, idxID)
 	return key
@@ -657,7 +677,7 @@ func EncodeTableIndexPrefix(tableID, idxID int64) kv.Key {
 
 // appendTableIndexPrefix appends table index prefix  "t[tableID]_i".
 func appendTableIndexPrefix(buf []byte, tableID int64) []byte {
-	buf = append(buf, tablePrefix...)
+	//buf = append(buf, tablePrefix...)
 	buf = codec.EncodeInt(buf, tableID)
 	buf = append(buf, indexPrefix...)
 	return buf

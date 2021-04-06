@@ -17,7 +17,6 @@ import (
 	"sync/atomic"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
 
 	"github.com/zhihu/zetta/pkg/meta"
@@ -255,24 +254,24 @@ const (
 )
 
 func init() {
-	schemaMySQLErrCodes := map[terror.ErrCode]uint16{
-		codeDBDropExists:        mysql.ErrDBDropExists,
-		codeDatabaseNotExists:   mysql.ErrBadDB,
-		codeTableNotExists:      mysql.ErrNoSuchTable,
-		codeColumnNotExists:     mysql.ErrBadField,
-		codeCannotAddForeign:    mysql.ErrCannotAddForeign,
-		codeWrongFkDef:          mysql.ErrWrongFkDef,
-		codeForeignKeyNotExists: mysql.ErrCantDropFieldOrKey,
-		codeDatabaseExists:      mysql.ErrDBCreateExists,
-		codeTableExists:         mysql.ErrTableExists,
-		codeBadTable:            mysql.ErrBadTable,
-		codeBadUser:             mysql.ErrBadUser,
-		codeColumnExists:        mysql.ErrDupFieldName,
-		codeIndexExists:         mysql.ErrDupIndex,
-		codeMultiplePriKey:      mysql.ErrMultiplePriKey,
-		codeTooManyKeyParts:     mysql.ErrTooManyKeyParts,
-		codeKeyNameDuplicate:    mysql.ErrDupKeyName,
-		codeKeyNotExists:        mysql.ErrKeyDoesNotExist,
-	}
-	terror.ErrClassToMySQLCodes[terror.ClassSchema] = schemaMySQLErrCodes
+	// schemaMySQLErrCodes := map[terror.ErrCode]uint16{
+	// 	codeDBDropExists:        mysql.ErrDBDropExists,
+	// 	codeDatabaseNotExists:   mysql.ErrBadDB,
+	// 	codeTableNotExists:      mysql.ErrNoSuchTable,
+	// 	codeColumnNotExists:     mysql.ErrBadField,
+	// 	codeCannotAddForeign:    mysql.ErrCannotAddForeign,
+	// 	codeWrongFkDef:          mysql.ErrWrongFkDef,
+	// 	codeForeignKeyNotExists: mysql.ErrCantDropFieldOrKey,
+	// 	codeDatabaseExists:      mysql.ErrDBCreateExists,
+	// 	codeTableExists:         mysql.ErrTableExists,
+	// 	codeBadTable:            mysql.ErrBadTable,
+	// 	codeBadUser:             mysql.ErrBadUser,
+	// 	codeColumnExists:        mysql.ErrDupFieldName,
+	// 	codeIndexExists:         mysql.ErrDupIndex,
+	// 	codeMultiplePriKey:      mysql.ErrMultiplePriKey,
+	// 	codeTooManyKeyParts:     mysql.ErrTooManyKeyParts,
+	// 	codeKeyNameDuplicate:    mysql.ErrDupKeyName,
+	// 	codeKeyNotExists:        mysql.ErrKeyDoesNotExist,
+	// }
+	// terror.ErrClassToMySQLCodes[terror.ClassSchema] = schemaMySQLErrCodes
 }

@@ -49,24 +49,28 @@ const (
 	generalWorker workerType = 0
 )
 
+var zettaDDLJobList = []byte("zettaDDLJobList")
+
 // worker is used for handling DDL jobs.
 // We only use one kind of worker now.
 type worker struct {
-	id       int32
-	tp       workerType
-	ddlJobCh chan struct{}
-	quitCh   chan struct{}
-	wg       sync.WaitGroup
+	id              int32
+	tp              workerType
+	ddlJobCh        chan struct{}
+	quitCh          chan struct{}
+	wg              sync.WaitGroup
+	delRangeManager *deleteRangeManager
 
 	logCtx context.Context
 }
 
-func newWorker(tp workerType, store kv.Storage) *worker {
+func newWorker(tp workerType, store kv.Storage, delRangeMgr *deleteRangeManager) *worker {
 	worker := &worker{
-		id:       atomic.AddInt32(&ddlWorkerID, 1),
-		tp:       tp,
-		ddlJobCh: make(chan struct{}, 1),
-		quitCh:   make(chan struct{}),
+		id:              atomic.AddInt32(&ddlWorkerID, 1),
+		tp:              tp,
+		ddlJobCh:        make(chan struct{}, 1),
+		quitCh:          make(chan struct{}),
+		delRangeManager: delRangeMgr,
 	}
 
 	worker.logCtx = logutil.WithKeyValue(context.Background(), "worker", worker.String())
@@ -171,7 +175,7 @@ func (w *worker) handleDDLJobQueue(d *ddlCtx) error {
 			})
 
 			if job.IsCancelled() {
-				txn.Reset()
+				txn.Discard()
 				err = w.finishDDLJob(t, job)
 				return errors.Trace(err)
 			}
@@ -265,7 +269,8 @@ func (w *worker) runDDLJob(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, 
 		logutil.Logger(w.logCtx).Error("[ddl] run DDL job error", zap.Error(err))
 
 		// Check error limit to avoid falling into an infinite loop.
-		if job.ErrorCount > variable.GetDDLErrorCountLimit() && job.State == model.JobStateRunning {
+		//if job.ErrorCount > variable.GetDDLErrorCountLimit() && job.State == model.JobStateRunning {
+		if job.ErrorCount > 64 && job.State == model.JobStateRunning {
 			logutil.Logger(w.logCtx).Warn("[ddl] DDL job error count exceed the limit, cancelling it now", zap.Int64("jobID", job.ID), zap.Int64("errorCountLimit", variable.GetDDLErrorCountLimit()))
 			job.State = model.JobStateCancelling
 		}
@@ -381,6 +386,17 @@ func (w *worker) waitSchemaSynced(d *ddlCtx, job *model.Job, waitTime time.Durat
 	w.waitSchemaChanged(ctx, d, waitTime, latestSchemaVersion, job)
 }
 
+func (w *worker) deleteRange(job *model.Job) error {
+	fmt.Println("delete range job:", job.TableID)
+	var err error
+	if job.Version <= currentVersion {
+		err = w.delRangeManager.addDelRangeJob(job)
+	} else {
+		err = errors.New("Invalid job version")
+	}
+	return errors.Trace(err)
+}
+
 // finishDDLJob deletes the finished DDL job in the ddl queue and puts it to history queue.
 // If the DDL job need to handle in background, it will prepare a background job.
 func (w *worker) finishDDLJob(t *meta.Meta, job *model.Job) (err error) {
@@ -388,6 +404,13 @@ func (w *worker) finishDDLJob(t *meta.Meta, job *model.Job) (err error) {
 	defer func() {
 		metrics.DDLWorkerHistogram.WithLabelValues(metrics.WorkerFinishDDLJob, job.Type.String(), metrics.RetLabel(err)).Observe(time.Since(startTime).Seconds())
 	}()
+
+	if !job.IsCancelled() {
+		switch job.Type {
+		case model.ActionDropTable, model.ActionTruncateTable:
+			err = w.deleteRange(job)
+		}
+	}
 
 	_, err = t.DeQueueDDLJob()
 	if err != nil {
@@ -423,7 +446,7 @@ func asyncNotify(ch chan struct{}) {
 }
 
 func newMetaWithQueueTp(txn kv.Transaction, tp string) *meta.Meta {
-	return meta.NewMeta(txn)
+	return meta.NewMeta(txn, zettaDDLJobList)
 }
 
 func toTError(err error) *terror.Error {
@@ -466,4 +489,11 @@ func updateSchemaVersion(t *meta.Meta, job *model.Job) (int64, error) {
 	}
 	err = t.SetSchemaDiff(diff)
 	return schemaVersion, errors.Trace(err)
+}
+
+func (w *worker) close() {
+	startTime := time.Now()
+	close(w.quitCh)
+	w.wg.Wait()
+	logutil.Logger(w.logCtx).Info("[ddl] DDL worker closed", zap.Duration("take time", time.Since(startTime)))
 }

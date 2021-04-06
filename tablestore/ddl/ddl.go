@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/ngaut/pools"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/ddl/util"
@@ -28,7 +29,6 @@ import (
 	"github.com/pingcap/tidb/sessionctx"
 	tidbutil "github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/logutil"
-	tspb "github.com/zhihu/zetta-proto/pkg/tablestore"
 	"github.com/zhihu/zetta/pkg/meta"
 	"github.com/zhihu/zetta/pkg/model"
 	"github.com/zhihu/zetta/tablestore/infoschema"
@@ -40,7 +40,7 @@ const (
 	// currentVersion is for all new DDL jobs.
 	currentVersion = 1
 	// DDLOwnerKey is the ddl owner path that is saved to etcd, and it's exported for testing.
-	DDLOwnerKey = "/tidb/ddl/fg/owner"
+	DDLOwnerKey = "/zetta-dev/ddl/fg/owner"
 	ddlPrompt   = "ddl"
 )
 
@@ -52,17 +52,23 @@ var (
 // DDL is responsible for updating schema in data store and maintaining in-memory InfoSchema cache.
 type DDL interface {
 	CreateSchema(ctx sessionctx.Context, dbmeta *model.DatabaseMeta) error
-	CreateTable(ctx sessionctx.Context, tbmeta *model.TableMeta) error
-	DropTable(ctx sessionctx.Context, db, table string) error
-	CreateIndex(ctx sessionctx.Context, db, table string, indexMeta *model.IndexMeta) error
-	AddColumn(ctx sessionctx.Context, req *tspb.AddColumnRequest) error
+	CreateTable(ctx sessionctx.Context, tbmeta *model.TableMeta, isexists bool) error
+	DropTable(ctx sessionctx.Context, db, table string, ifexists bool) error
+	CreateIndex(ctx sessionctx.Context, db, table string, indexMeta *model.IndexMeta, ifNotExists bool) error
+	//AddColumn(ctx sessionctx.Context, req *tspb.AddColumnRequest) error
+	AddColumn(ctx sessionctx.Context, dbName, tblName string, cols []*model.ColumnMeta) error
+	SchemaSyncer() util.SchemaSyncer
+	GetID() string
 	Stop() error
+	IsOwner() bool
 }
 
 // ddl is used to handle the statements that define the structure or schema of the database.
 type ddl struct {
-	m      sync.RWMutex
-	quitCh chan struct{}
+	m           sync.RWMutex
+	quitCh      chan struct{}
+	sessPool    *sessionPool
+	delRangeMgr *deleteRangeManager
 
 	*ddlCtx
 	workers map[workerType]*worker
@@ -94,27 +100,26 @@ func (dc *ddlCtx) isOwner() bool {
 
 // NewDDL creates a new DDL.
 func NewDDL(ctx context.Context, etcdCli *clientv3.Client, store kv.Storage,
-	infoHandle *infoschema.Handler, hook Callback, lease time.Duration) DDL {
-	return newDDL(ctx, etcdCli, store, infoHandle, hook, lease)
+	infoHandle *infoschema.Handler, hook Callback, lease time.Duration, pool *pools.ResourcePool) DDL {
+	return newDDL(ctx, etcdCli, store, infoHandle, hook, lease, pool)
 }
 
 func newDDL(ctx context.Context, etcdCli *clientv3.Client, store kv.Storage,
-	infoHandle *infoschema.Handler, hook Callback, lease time.Duration) *ddl {
+	infoHandle *infoschema.Handler, hook Callback, lease time.Duration, pool *pools.ResourcePool) *ddl {
 	if hook == nil {
 		hook = &BaseCallback{}
 	}
 
 	id := uuid.New().String()
-	ctx, cancelFunc := context.WithCancel(ctx)
 	var manager owner.Manager
 	var syncer util.SchemaSyncer
 	if etcdCli == nil {
 		// The etcdCli is nil if the store is localstore which is only used for testing.
 		// So we use mockOwnerManager and MockSchemaSyncer.
-		manager = owner.NewMockManager(id, cancelFunc)
+		manager = owner.NewMockManager(ctx, id)
 		syncer = NewMockSchemaSyncer()
 	} else {
-		manager = owner.NewOwnerManager(etcdCli, ddlPrompt, id, DDLOwnerKey, cancelFunc)
+		manager = owner.NewOwnerManager(ctx, etcdCli, ddlPrompt, id, DDLOwnerKey)
 		syncer = util.NewSchemaSyncer(etcdCli, id, manager)
 	}
 
@@ -132,12 +137,34 @@ func newDDL(ctx context.Context, etcdCli *clientv3.Client, store kv.Storage,
 	d := &ddl{
 		ddlCtx: ddlCtx,
 	}
+	d.sessPool = newSessionPool(pool)
+	d.delRangeMgr = d.newDeleteRangeManager()
 	d.start(ctx)
 	return d
 }
 
+func (d *ddl) newDeleteRangeManager() *deleteRangeManager {
+	return newDelRangeManager(d.store, d.sessPool)
+}
+
+func (d *ddl) GetRangesToDelete(ctx context.Context, ts uint64) ([]kv.KeyRange, error) {
+	return d.delRangeMgr.getRangesToDelete(ctx, ts)
+}
+
+func (d *ddl) ClearRangeRecord(ctx context.Context, rg kv.KeyRange) error {
+	return d.delRangeMgr.clearRangeInfo(ctx, rg)
+}
+
+func (d *ddl) IsOwner() bool {
+	return d.isOwner()
+}
+
 func (d *ddl) GetStore() kv.Storage {
 	return d.ddlCtx.store
+}
+
+func (d *ddl) SchemaSyncer() util.SchemaSyncer {
+	return d.schemaSyncer
 }
 
 // start campaigns the owner and starts workers.
@@ -148,13 +175,13 @@ func (d *ddl) start(ctx context.Context) {
 	// If RunWorker is true, we need campaign owner and do DDL job.
 	// Otherwise, we needn't do that.
 	if RunWorker {
-		err := d.ownerManager.CampaignOwner(ctx)
+		err := d.ownerManager.CampaignOwner()
 		terror.Log(errors.Trace(err))
 
 		//We only support one worker type now for simpliness.
 		//Maybe add more worker type later.
 		d.workers = make(map[workerType]*worker, 1)
-		d.workers[generalWorker] = newWorker(generalWorker, d.store)
+		d.workers[generalWorker] = newWorker(generalWorker, d.store, d.delRangeMgr)
 		for _, worker := range d.workers {
 			worker.wg.Add(1)
 			w := worker
@@ -179,6 +206,10 @@ func (d *ddl) start(ctx context.Context) {
 				}
 			})
 	}
+}
+
+func (d *ddl) GetID() string {
+	return d.uuid
 }
 
 func (d *ddl) doDDLJob(ctx sessionctx.Context, job *model.Job) error {
@@ -289,7 +320,34 @@ func (d *ddl) GetInfoSchemaWithInterceptor(ctx sessionctx.Context) infoschema.In
 	return d.mu.interceptor.OnGetInfoSchema(ctx, is)
 }
 
+func (d *ddl) close() {
+	if isChanClosed(d.quitCh) {
+		return
+	}
+	startTime := time.Now()
+	close(d.quitCh)
+
+	d.ownerManager.Cancel()
+	d.schemaSyncer.CloseCleanWork()
+	err := d.schemaSyncer.RemoveSelfVersionPath()
+	if err != nil {
+		logutil.Logger(ddlLogCtx).Error("[ddl] remove self version path failed", zap.Error(err))
+	}
+
+	for _, worker := range d.workers {
+		worker.close()
+	}
+	// d.delRangeMgr using sessions from d.sessPool.
+	// Put it before d.sessPool.close to reduce the time spent by d.sessPool.close.
+
+	logutil.Logger(ddlLogCtx).Info("[ddl] DDL closed", zap.String("ID", d.uuid), zap.Duration("take time", time.Since(startTime)))
+}
+
 func (d *ddl) Stop() error {
+	d.m.Lock()
+	defer d.m.Unlock()
+	d.close()
+	logutil.Logger(context.Background()).Info("[ddl] stop DDL", zap.String("ID", d.uuid))
 	return nil
 }
 

@@ -73,7 +73,7 @@ func (*testSuite) TestT(c *C) {
 		return errors.Trace(err)
 	})
 
-	_, err = Bootstrap(store)
+	_, err = Bootstrap(store, nil)
 	c.Assert(err, IsNil)
 	do := GetDomain4Test()
 	is := do.InfoSchema()

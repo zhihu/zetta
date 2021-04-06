@@ -19,6 +19,7 @@ import (
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
+	parser_model "github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/sessionctx"
@@ -57,12 +58,14 @@ func testTableInfo(c *C, d *ddl, name string, num int) *model.TableMeta {
 				Name:       fmt.Sprintf("c%d", i+1),
 				ColumnType: &tspb.Type{Code: tspb.TypeCode_INT64},
 			},
-			Offset:       i,
-			DefaultValue: i + 1,
-			State:        model.StatePublic,
+			ColumnInfo: parser_model.ColumnInfo{
+				Offset:       i,
+				DefaultValue: i + 1,
+				State:        parser_model.StatePublic,
+			},
 		}
 
-		col.FieldType = types.NewFieldType(mysql.TypeLong)
+		col.FieldType = *types.NewFieldType(mysql.TypeLong)
 		col.Id = allocateColumnID(tblInfo)
 		cols[i] = col
 	}
@@ -82,9 +85,9 @@ func testCreateTable(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.Databas
 	c.Assert(err, IsNil)
 
 	v := getSchemaVer(c, ctx)
-	tblInfo.State = model.StatePublic
+	tblInfo.State = parser_model.SchemaState(model.StatePublic)
 	checkHistoryJobArgs(c, ctx, job.ID, &historyJobArgs{ver: v, tbl: tblInfo})
-	tblInfo.State = model.StateNone
+	tblInfo.State = parser_model.SchemaState(model.StateNone)
 	return job
 }
 

@@ -142,7 +142,7 @@ func EncodeMySQLTime(sc *stmtctx.StatementContext, d types.Datum, tp byte, b []b
 	// Encoding timestamp need to consider timezone. If it's not in UTC, transform to UTC first.
 	// This is compatible with `PBToExpr > convertTime`, and coprocessor assumes the passed timestamp is in UTC as well.
 	if tp == mysql.TypeUnspecified {
-		tp = t.Type
+		tp = t.Type()
 	}
 	if tp == mysql.TypeTimestamp && sc.TimeZone != time.UTC {
 		err = t.ConvertTimeZone(sc.TimeZone, time.UTC)
@@ -238,7 +238,7 @@ func encodeHashChunkRow(sc *stmtctx.StatementContext, b []byte, row chunk.Row, a
 			t := row.GetTime(i)
 			// Encoding timestamp need to consider timezone.
 			// If it's not in UTC, transform to UTC first.
-			if t.Type == mysql.TypeTimestamp && sc.TimeZone != time.UTC {
+			if t.Type() == mysql.TypeTimestamp && sc.TimeZone != time.UTC {
 				err = t.ConvertTimeZone(sc.TimeZone, time.UTC)
 				if err != nil {
 					return nil, errors.Trace(err)
@@ -413,7 +413,7 @@ func DecodeOne(b []byte) (remain []byte, d types.Datum, err error) {
 		if err == nil {
 			// use max fsp, let outer to do round manually.
 			v := types.Duration{Duration: time.Duration(r), Fsp: types.MaxFsp}
-			d.SetValue(v)
+			d.SetMysqlDuration(v)
 		}
 	case jsonFlag:
 		var size int
@@ -641,7 +641,7 @@ func (decoder *Decoder) DecodeOne(b []byte, colIdx int, ft *types.FieldType) (re
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		v := types.Duration{Duration: time.Duration(r), Fsp: ft.Decimal}
+		v := types.Duration{Duration: time.Duration(r), Fsp: int8(ft.Decimal)}
 		chk.AppendDuration(colIdx, v)
 	case jsonFlag:
 		var size int
@@ -665,7 +665,7 @@ func (decoder *Decoder) DecodeOne(b []byte, colIdx int, ft *types.FieldType) (re
 func appendIntToChunk(val int64, chk *chunk.Chunk, colIdx int, ft *types.FieldType) {
 	switch ft.Tp {
 	case mysql.TypeDuration:
-		v := types.Duration{Duration: time.Duration(val), Fsp: ft.Decimal}
+		v := types.Duration{Duration: time.Duration(val), Fsp: int8(ft.Decimal)}
 		chk.AppendDuration(colIdx, v)
 	default:
 		chk.AppendInt64(colIdx, val)
@@ -675,9 +675,7 @@ func appendIntToChunk(val int64, chk *chunk.Chunk, colIdx int, ft *types.FieldTy
 func appendUintToChunk(val uint64, chk *chunk.Chunk, colIdx int, ft *types.FieldType, loc *time.Location) error {
 	switch ft.Tp {
 	case mysql.TypeDate, mysql.TypeDatetime, mysql.TypeTimestamp:
-		var t types.Time
-		t.Type = ft.Tp
-		t.Fsp = ft.Decimal
+		t := types.NewTime(types.ZeroCoreTime, ft.Tp, int8(ft.Decimal))
 		var err error
 		err = t.FromPackedUint(val)
 		if err != nil {

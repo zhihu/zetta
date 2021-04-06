@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/util/logutil"
 	"go.uber.org/zap"
@@ -31,6 +32,7 @@ import (
 	"github.com/zhihu/zetta/tablestore/rpc"
 	"github.com/zhihu/zetta/tablestore/sessionctx"
 	"github.com/zhihu/zetta/tablestore/sessionctx/variable"
+	"github.com/zhihu/zetta/tablestore/zstore"
 )
 
 var (
@@ -56,7 +58,9 @@ type Session interface {
 	HandleRead(context.Context, rpc.ReadRequest, kv.Transaction) (RecordSet, error)
 	HandleMutate(context.Context, rpc.MutationRequest, kv.Transaction) (rpc.Response, error)
 
-	RetrieveTxn(context.Context, *tspb.TransactionSelector, bool) (*TxnState, error)
+	RetrieveTxn(context.Context, *tspb.TransactionSelector, *RetrieveTxnOpt) (*TxnState, error)
+
+	RawkvAccess(context.Context, string) (bool, error)
 
 	CommitTxn(context.Context, kv.Transaction) error
 	RollbackTxn(context.Context, kv.Transaction) error
@@ -68,6 +72,11 @@ type Session interface {
 	SetLastActive(time.Time)
 	LastActive() time.Time
 	Active() bool
+}
+
+type RetrieveTxnOpt struct {
+	Committable bool
+	IsRawKV     bool
 }
 
 var (
@@ -150,15 +159,41 @@ func (s *session) SetDB(db string) {
 	s.database = db
 }
 
-func (s *session) CreateTxn(ctx context.Context, single bool, readOnly bool) (kv.Transaction, error) {
+func (s *session) createTxn(ctx context.Context, txnOpt TxnStateOption) (kv.Transaction, error) {
 	txn, err := NewTxnState(s)
 	if err != nil {
 		logutil.Logger(ctx).Error("create txnState error", zap.Error(err), zap.String("session", s.name))
 		return nil, err
 	}
-	txn.Single = single
-	txn.ReadOnly = readOnly
+	txn.TxnOpt = txnOpt
 	return txn, nil
+}
+
+// PrepareTSFuture uses to try to get ts future.
+func (s *session) PrepareTSFuture(ctx context.Context, txn *TxnState) {
+	if !txn.validOrPending() {
+		// Prepare the transaction future if the transaction is invalid (at the beginning of the transaction).
+		txnFuture := s.getTxnFuture(ctx)
+		txn.changeInvalidToPending(txnFuture)
+	}
+}
+
+func (s *session) PrepareTxnCtx(ctx context.Context, txn *TxnState) {
+	if txn.validOrPending() {
+		return
+	}
+	//TODO: set sessionVars TxnCtx
+}
+
+func (s *session) PrepareRawkvTxn(ctx context.Context, txn *TxnState) {
+	if txn.TxnOpt.isRawKV {
+		zStore, ok := s.store.(*zstore.ZStore)
+		if !ok {
+			return
+		}
+		startTs := time.Now().Unix()
+		txn.Transaction, _ = zStore.BeginWithRawKV(uint64(startTs))
+	}
 }
 
 func (s *session) CommitTxn(ctx context.Context, txn kv.Transaction) error {
@@ -216,8 +251,8 @@ func (s *session) GetSessionVars() *variable.SessionVars {
 	return s.sessionVars
 }
 
-func (s *session) RetrieveTxn(ctx context.Context, sel *tspb.TransactionSelector, commitable bool) (*TxnState, error) {
-	txn, err := s.readTx(ctx, sel, commitable)
+func (s *session) RetrieveTxn(ctx context.Context, sel *tspb.TransactionSelector, opt *RetrieveTxnOpt) (*TxnState, error) {
+	txn, err := s.readTx(ctx, sel, opt)
 	return txn, err
 }
 
@@ -243,7 +278,7 @@ func (s *session) InitTxnWithStartTS(startTS uint64) error {
 		return err
 	}
 	s.txn.changeInvalidToValid(txn)
-	s.txn.SetCap(s.getMembufCap())
+	// loadCommonGlobalVariablesIfNeeded
 	return nil
 }
 
@@ -264,7 +299,6 @@ func (s *session) NewTxn(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	txn.SetCap(s.getMembufCap())
 	txn.SetVars(s.sessionVars.KVVars)
 	s.txn.changeInvalidToValid(txn)
 	is := domain.GetOnlyDomain().InfoSchema()
@@ -278,15 +312,13 @@ func (s *session) NewTxn(ctx context.Context) error {
 }
 
 func (s *session) newTxn(ctx context.Context) (*TxnState, error) {
-	txn := &TxnState{
-		buf: kv.NewMemDbBuffer(kv.DefaultTxnMembufCap),
-	}
+	txn := &TxnState{}
+	txn.init()
 	kvtxn, err := s.store.Begin()
 	if err != nil {
 		return nil, err
 	}
 	txn.Transaction = kvtxn
-	txn.SetCap(s.getMembufCap())
 	txn.SetVars(s.sessionVars.KVVars)
 	s.txn.changeInvalidToValid(txn)
 	is := domain.GetOnlyDomain().InfoSchema()
@@ -300,27 +332,42 @@ func (s *session) newTxn(ctx context.Context) (*TxnState, error) {
 }
 
 func (s *session) Txn(active bool) (kv.Transaction, error) {
+	if !s.txn.validOrPending() && active {
+		return &s.txn, errors.AddStack(kv.ErrInvalidTxn)
+	}
 	if s.txn.pending() && active {
 		// Transaction is lazy initialized.
 		// PrepareTxnCtx is called to get a tso future, makes s.txn a pending txn,
 		// If Txn() is called later, wait for the future to get a valid txn.
-		txnCap := s.getMembufCap()
-		if err := s.txn.changePendingToValid(txnCap); err != nil {
-			logutil.Logger(context.Background()).Error("active transaction fail",
+		if err := s.txn.changePendingToValid(); err != nil {
+			logutil.BgLogger().Error("active transaction fail",
 				zap.Error(err))
 			s.txn.cleanup()
-			s.sessionVars.TxnCtx.StartTS = 0
 			return &s.txn, err
 		}
-		s.sessionVars.TxnCtx.StartTS = s.txn.StartTS()
-		if s.sessionVars.TxnCtx.IsPessimistic {
-			s.txn.SetOption(kv.Pessimistic, true)
-		}
-		// if !s.sessionVars.IsAutocommit() {
-		// 	s.sessionVars.SetStatusFlag(mysql.ServerStatusInTrans, true)
-		// }
 	}
 	return &s.txn, nil
+}
+
+func (s *session) FetchTxn(txn *TxnState, active bool) error {
+	if txn.TxnOpt.isRawKV {
+		return nil
+	}
+	if !txn.validOrPending() && active {
+		return errors.AddStack(kv.ErrInvalidTxn)
+	}
+	if txn.pending() && active {
+		// Transaction is lazy initialized.
+		// PrepareTxnCtx is called to get a tso future, makes s.txn a pending txn,
+		// If Txn() is called later, wait for the future to get a valid txn.
+		if err := txn.changePendingToValid(); err != nil {
+			logutil.BgLogger().Error("active transaction fail",
+				zap.Error(err))
+			s.txn.cleanup()
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *session) insertTxn(txn *TxnState) {
@@ -329,18 +376,10 @@ func (s *session) insertTxn(txn *TxnState) {
 	s.txns[txn.ID] = txn
 }
 
-func (s *session) dropTxn(txnId string) {
+func (s *session) dropTxn(txnID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.txns, txnId)
-}
-
-func (s *session) getMembufCap() int {
-	if s.sessionVars.LightningMode {
-		return kv.ImportingTxnMembufCap
-	}
-
-	return kv.DefaultTxnMembufCap
+	delete(s.txns, txnID)
 }
 
 func genRandomSession() string {

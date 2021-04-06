@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ngaut/pools"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/zhihu/zetta/pkg/meta"
@@ -70,7 +71,7 @@ func (dm *domainMap) Get(store kv.Storage) (d *domain.Domain, err error) {
 	// if err != nil {
 	// 	return nil, err
 	// }
-	d = domain.NewDomain(store)
+	//d = domain.NewDomain(store)
 	d.Init(10 * time.Second)
 	dm.domains[key] = d
 
@@ -192,9 +193,21 @@ func GetDomain(store kv.Storage) (*domain.Domain, error) {
 }
 
 // BootstrapSession runs the first time when the TiDB server start.
+/*
 func BootstrapSession(store kv.Storage) (*domain.Domain, error) {
 	// cfg := config.GetGlobalConfig()
-	dm := domain.NewDomain(store)
+	dm := domain.NewDomain(store, CreateSessionFunc)
 	// dm.Init()
 	return dm, nil
+}
+*/
+
+func CreateSessionFunc(store kv.Storage) pools.Factory {
+	return func() (pools.Resource, error) {
+		se, err := createSession(store)
+		if err != nil {
+			return nil, err
+		}
+		return se, nil
+	}
 }

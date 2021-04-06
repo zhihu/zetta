@@ -55,7 +55,7 @@ func (c *Column) String() string {
 // FindCol finds column in cols by name.
 func FindCol(cols []*model.ColumnMeta, name string) *model.ColumnMeta {
 	for _, col := range cols {
-		if strings.EqualFold(col.Name, name) {
+		if strings.EqualFold(col.ColumnMeta.Name, name) {
 			return col
 		}
 	}
@@ -82,26 +82,56 @@ func truncateTrailingSpaces(v *types.Datum) {
 	}
 	b = b[:length]
 	str := string(hack.String(b))
-	v.SetString(str)
+	v.SetString(str, v.Collation())
 }
 
 // ColDesc describes column information like MySQL desc and show columns do.
 type ColDesc struct {
 	Field string
 	Type  string
+	Key   string
 	// Charset is nil if the column doesn't have a charset, or a string indicating the charset name.
-	Charset interface{}
+	//Charset interface{}
 	// Collation is nil if the column doesn't have a collation, or a string indicating the collation name.
-	Collation    interface{}
-	Null         string
-	Key          string
-	DefaultValue interface{}
-	Extra        string
-	Privileges   string
-	Comment      string
+	//Collation interface{}
+	//Null         string
+	//DefaultValue interface{}
 }
 
 const defaultPrivileges = "select,insert,update,references"
+
+// NewColDesc returns a new ColDesc for a column.
+func NewColDesc(tbl Table, col *Column) *ColDesc {
+	// TODO: if we have no primary key and a unique index which's columns are all not null
+	// we will set these columns' flag as PriKeyFlag
+	// see https://dev.mysql.com/doc/refman/5.7/en/show-columns.html
+	// create table
+	name := col.ColumnMeta.ColumnMeta.Name
+	idxName := "null"
+	_, idxMeta := tbl.Meta().GetIndexByColumnName(name)
+	if idxMeta != nil {
+		idxName = idxMeta.Name
+	}
+	if col.IsPrimary {
+		idxName = "primary"
+	}
+
+	desc := &ColDesc{
+		Field: name,
+		Type:  col.GetTypeDesc(),
+		Key:   idxName,
+		//Charset:   col.Charset,
+		//Collation: col.Collate,
+	}
+	return desc
+}
+
+func NewCFDesc(cf *model.ColumnFamilyMeta) *ColDesc {
+	return &ColDesc{
+		Field: cf.Name,
+		Type:  "ColumnFamily",
+	}
+}
 
 // GetTypeDesc gets the description for column type.
 func (c *Column) GetTypeDesc() string {
@@ -120,14 +150,15 @@ func ColDescFieldNames(full bool) []string {
 	if full {
 		return []string{"Field", "Type", "Collation", "Null", "Key", "Default", "Extra", "Privileges", "Comment"}
 	}
-	return []string{"Field", "Type", "Null", "Key", "Default", "Extra"}
+	//return []string{"Field", "Type", "Null", "Key", "Default", "Extra"}
+	return []string{"Field", "Type", "Key"}
 }
 
 // CheckOnce checks if there are duplicated column names in cols.
 func CheckOnce(cols []*model.ColumnMeta) error {
 	m := map[string]struct{}{}
 	for _, col := range cols {
-		name := col.Name
+		name := col.ColumnMeta.Name
 		_, ok := m[name]
 		if ok {
 			return ErrDuplicateColumn.GenWithStack("column specified twice - %s", name)
@@ -141,7 +172,7 @@ func CheckOnce(cols []*model.ColumnMeta) error {
 // CheckNotNull checks if nil value set to a column with NotNull flag is set.
 func (c *Column) CheckNotNull(data types.Datum) error {
 	if (mysql.HasNotNullFlag(c.Flag) || mysql.HasPreventNullInsertFlag(c.Flag)) && data.IsNull() {
-		return ErrColumnCantNull.GenWithStackByArgs(c.Name)
+		return ErrColumnCantNull.GenWithStackByArgs(c.ColumnMeta.ColumnMeta.Name)
 	}
 	return nil
 }

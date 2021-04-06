@@ -74,7 +74,7 @@ func (d *ddl) restartWorkers(ctx context.Context) {
 		return
 	}
 
-	err := d.ownerManager.CampaignOwner(ctx)
+	err := d.ownerManager.CampaignOwner()
 	terror.Log(err)
 	for _, worker := range d.workers {
 		worker.wg.Add(1)
@@ -124,7 +124,7 @@ func testNewContext(d *ddl) sessionctx.Context {
 
 func testNewDDL(ctx context.Context, etcdCli *clientv3.Client, store kv.Storage,
 	infoHandle *infoschema.Handler, hook Callback, lease time.Duration) *ddl {
-	return newDDL(ctx, etcdCli, store, infoHandle, hook, lease)
+	return newDDL(ctx, etcdCli, store, infoHandle, hook, lease, nil)
 }
 
 func getSchemaVer(c *C, ctx sessionctx.Context) int64 {

@@ -98,20 +98,20 @@ func onAddIndex(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, err error) 
 	case model.StateWriteReorganization:
 		// reorganization -> public
 
-		tbl, err := getTable(d.store, schemaID, tblInfo)
-		if err != nil {
-			return ver, errors.Trace(err)
-		}
+		//tbl, err := getTable(d.store, schemaID, tblInfo)
+		//if err != nil {
+		//	return ver, errors.Trace(err)
+		//}
 
-		reorgInfo, err := getReorgInfo(d, t, job, tbl)
-		if err != nil || reorgInfo.first {
-			// If we run reorg firstly, we should update the job snapshot version
-			// and then run the reorg next time.
-			return ver, errors.Trace(err)
-		}
+		//reorgInfo, err := getReorgInfo(d, t, job, tbl)
+		//if err != nil || reorgInfo.first {
+		// If we run reorg firstly, we should update the job snapshot version
+		// and then run the reorg next time.
+		//	return ver, errors.Trace(err)
+		//}
 
-		err = addTableIndexByWorker(tbl, idxInfo, reorgInfo)
-		idxInfo.State = model.StatePublic
+		//err = addTableIndexByWorker(tbl, idxInfo, reorgInfo)
+		//idxInfo.State = model.StatePublic
 		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != idxInfo.State)
 		if err != nil {
 			return ver, errors.Trace(err)
@@ -261,12 +261,12 @@ func (a *AddIndexWorker) createIndex(t *IndexTask) ([]byte, error) {
 			indexBatchKeys = append(indexBatchKeys, iKey)
 			r.indexKey = iKey
 		}
-		batchValues, err := txn.BatchGet(indexBatchKeys)
+		batchValues, err := txn.BatchGet(context.TODO(), indexBatchKeys)
 		for _, r := range records {
 			if _, ok := batchValues[string(r.indexKey)]; !ok {
 				// Lock the row key to notify us that someone delete or update the row,
 				// then we should not backfill the index of it, otherwise the adding index is redundant.
-				err = txn.LockKeys(context.Background(), nil, 0, kv.LockAlwaysWait, r.key)
+				err = txn.LockKeys(context.Background(), new(kv.LockCtx), r.key)
 				if err != nil {
 					return errors.Trace(err)
 				}
@@ -488,7 +488,7 @@ func iterateSnapshotRows(store kv.Storage, priority int, t table.Table, version 
 	)
 
 	snap, err := store.GetSnapshot(ver)
-	snap.SetPriority(priority)
+	snap.SetOption(kv.Priority, priority)
 	if err != nil {
 		return errors.Trace(err)
 	}

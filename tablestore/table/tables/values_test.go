@@ -62,24 +62,16 @@ func mustParseTime(s string) time.Time {
 }
 
 func buildDatumTime(tt time.Time) types.Time {
-	return types.Time{
-		Time: types.FromGoTime(tt),
-		Type: mysql.TypeTimestamp,
-		Fsp:  0,
-	}
+	return types.NewTime(types.FromGoTime(tt), mysql.TypeTimestamp, 0)
 }
 
 func buildDatumDate(date civil.Date) types.Time {
-	return types.Time{
-		Time: types.FromGoTime(date.In(time.UTC)),
-		Type: mysql.TypeDate,
-		Fsp:  0,
-	}
+	return types.NewTime(types.FromGoTime(date.In(time.UTC)), mysql.TypeDate, 0)
 }
 
-func buildFromGoTime(tt time.Time) types.MysqlTime {
-	return types.MysqlTime{}
-}
+// func buildFromGoTime(tt time.Time) types.MysqlTime {
+// 	return types.MysqlTime{}
+// }
 
 func TestT(t *testing.T) {
 	TestingT(t)

@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/metrics"
@@ -207,6 +206,7 @@ func (m *Meta) checkTableExists(dbKey []byte, tableKey []byte) error {
 }
 
 func (m *Meta) checkTableNotExists(dbKey []byte, tableKey []byte) error {
+	fmt.Println("meta checkTableExists:", string(dbKey), string(tableKey))
 	v, err := m.txn.HGet(dbKey, tableKey)
 	if err == nil && v != nil {
 		err = ErrTableExists
@@ -806,12 +806,12 @@ const (
 	codeTableNotExists    = 1146
 )
 
-func init() {
-	metaMySQLErrCodes := map[terror.ErrCode]uint16{
-		codeDatabaseExists:    mysql.ErrDBCreateExists,
-		codeDatabaseNotExists: mysql.ErrBadDB,
-		codeTableNotExists:    mysql.ErrNoSuchTable,
-		codeTableExists:       mysql.ErrTableExists,
-	}
-	terror.ErrClassToMySQLCodes[terror.ClassMeta] = metaMySQLErrCodes
-}
+// func init() {
+// 	metaMySQLErrCodes := map[terror.ErrCode]uint16{
+// 		codeDatabaseExists:    mysql.ErrDBCreateExists,
+// 		codeDatabaseNotExists: mysql.ErrBadDB,
+// 		codeTableNotExists:    mysql.ErrNoSuchTable,
+// 		codeTableExists:       mysql.ErrTableExists,
+// 	}
+// 	terror.ErrClassToMySQLCodes[terror.ClassMeta] = metaMySQLErrCodes
+// }
